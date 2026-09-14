@@ -10,6 +10,8 @@ variables:
   - group: intelewriter-acr
   - name: imageRepository
     value: intelequia-librechat-adminpanel
+  - name: adminPanelBasePath
+    value: /adminpanel
   - name: vmImageName
     value: ubuntu-latest
 
@@ -51,6 +53,7 @@ steps:
         --build-arg "BUILD_COMMIT=${SOURCE_VERSION}" \
         --build-arg "BUILD_BRANCH=${SOURCE_BRANCH}" \
         --build-arg "BUILD_DATE=${build_date}" \
+        --build-arg "VITE_BASE_PATH=${ADMIN_PANEL_BASE_PATH}" \
         --push \
         "$SOURCE_DIRECTORY"
     env:
@@ -62,3 +65,4 @@ steps:
       SOURCE_VERSION: $(Build.SourceVersion)
       BUILD_ID: $(Build.BuildId)
       SOURCE_DIRECTORY: $(Build.SourcesDirectory)
+      ADMIN_PANEL_BASE_PATH: $(adminPanelBasePath)

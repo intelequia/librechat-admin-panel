@@ -28,7 +28,9 @@ RUN bun install --frozen-lockfile \
 
 # --- Runtime ---
 FROM base AS runtime
+ARG VITE_BASE_PATH=/
 ENV NODE_ENV=production
+ENV VITE_BASE_PATH=${VITE_BASE_PATH}
 
 COPY --from=prod-deps /app/node_modules node_modules
 COPY --from=build /app/dist dist
