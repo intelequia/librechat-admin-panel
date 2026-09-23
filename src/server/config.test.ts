@@ -2,19 +2,25 @@ import { createRequire } from 'module';
 import { describe, it, expect } from 'vitest';
 import type * as t from '@/types';
 import {
+  extractSchemaTree,
+  getZodTypeName,
+  flattenTree,
+  resolveSubSchema,
+  validateFieldValue,
+  parseIndexedArrayPath,
+  toConfigArraySource,
+  normalizeAppServiceKeys,
+  mergeConfigArraySources,
+  mergeIndexedArrayEntriesIntoBase,
+  applyLangfuseSchemaVisibility,
+} from './config';
+import {
   coerceEnumValue,
   getControlType,
   getEnumOptions,
   getArrayItemType,
   splitUnionTypes,
 } from '@/components/configuration/utils';
-import {
-  extractSchemaTree,
-  getZodTypeName,
-  flattenTree,
-  resolveSubSchema,
-  validateFieldValue,
-} from './config';
 
 interface ZodV3Schema extends t.ZodSchemaLike {
   object: (shape: Record<string, ZodV3Schema>) => ZodV3Schema;
@@ -71,6 +77,57 @@ function findField(fields: t.SchemaField[], key: string): t.SchemaField | undefi
   }
   return undefined;
 }
+
+describe('applyLangfuseSchemaVisibility', () => {
+  it('injects the Langfuse section when fanout is enabled and the pinned schema lacks it', () => {
+    const tree = extractSchemaTree(z3.object({ interface: z3.object({ theme: z3.string() }) }));
+
+    applyLangfuseSchemaVisibility(tree, true);
+
+    expect(findField(tree, 'langfuse')).toMatchObject({
+      key: 'langfuse',
+      isObject: true,
+    });
+    expect(findField(tree, 'destination')?.path).toBe('langfuse.destination');
+  });
+
+  it('removes a Langfuse section supplied by the schema when fanout is disabled', () => {
+    const tree = extractSchemaTree(z3.object({ langfuse: z3.object({ enabled: z3.boolean() }) }));
+
+    applyLangfuseSchemaVisibility(tree, false);
+
+    expect(findField(tree, 'langfuse')).toBeUndefined();
+  });
+
+  it('preserves the schema-provided Langfuse section when fanout is enabled', () => {
+    const tree = extractSchemaTree(
+      z3.object({ langfuse: z3.object({ schemaOnlyField: z3.string() }) }),
+    );
+
+    applyLangfuseSchemaVisibility(tree, true);
+
+    expect(findField(tree, 'schemaOnlyField')).toBeDefined();
+    expect(tree.filter((field) => field.key === 'langfuse')).toHaveLength(1);
+  });
+
+  it('preserves a schema-provided Langfuse section when fanout state is unknown', () => {
+    const tree = extractSchemaTree(
+      z3.object({ langfuse: z3.object({ schemaOnlyField: z3.string() }) }),
+    );
+
+    applyLangfuseSchemaVisibility(tree, undefined);
+
+    expect(findField(tree, 'schemaOnlyField')).toBeDefined();
+  });
+
+  it('does not inject the compatibility shim when fanout state is unknown', () => {
+    const tree = extractSchemaTree(z3.object({ interface: z3.object({ theme: z3.string() }) }));
+
+    applyLangfuseSchemaVisibility(tree, undefined);
+
+    expect(findField(tree, 'langfuse')).toBeUndefined();
+  });
+});
 
 describe('extractSchemaTree', () => {
   it('extracts basic scalar types', () => {
@@ -621,6 +678,92 @@ describe('validateFieldValue', () => {
     const result = validateFieldValue('interface', { privacyPolicy: {} });
     expect(result).toBeDefined();
   });
+
+  it('accepts streamable-http type for MCP server', () => {
+    expect(validateFieldValue('mcpServers.foo.type', 'streamable-http')).toEqual({ success: true });
+  });
+
+  it('accepts http type for MCP server', () => {
+    expect(validateFieldValue('mcpServers.foo.type', 'http')).toEqual({ success: true });
+  });
+
+  it('accepts stdio type for MCP server', () => {
+    expect(validateFieldValue('mcpServers.foo.type', 'stdio')).toEqual({ success: true });
+  });
+
+  it('rejects unknown type for MCP server', () => {
+    const result = validateFieldValue('mcpServers.foo.type', 'made-up-transport');
+    expect(result.success).toBe(false);
+  });
+
+  it('returns the most-specific branch on union failure (anyOfSchema heuristic)', () => {
+    const result = validateFieldValue('mcpServers.foo.type', 'made-up-transport');
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      const semicolonSplits = result.error.split(';');
+      expect(semicolonSplits.length).toBeLessThanOrEqual(2);
+      expect(result.error.length).toBeGreaterThan(0);
+    }
+  });
+
+  it('accepts https URL for MCP server (matches sse/streamable-http branches)', () => {
+    expect(validateFieldValue('mcpServers.foo.url', 'https://example.com/mcp')).toEqual({
+      success: true,
+    });
+  });
+
+  it('accepts ws URL for MCP server (matches websocket branch)', () => {
+    expect(validateFieldValue('mcpServers.foo.url', 'wss://example.com/mcp')).toEqual({
+      success: true,
+    });
+  });
+
+  it('rejects non-URL value for MCP server', () => {
+    const result = validateFieldValue('mcpServers.foo.url', 'not a url');
+    expect(result.success).toBe(false);
+  });
+
+  it('returns a single-branch error on union URL failure, not a concatenated dump', () => {
+    const result = validateFieldValue('mcpServers.foo.url', 'not a url');
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      const semicolonSplits = result.error.split(';');
+      expect(semicolonSplits.length).toBeLessThanOrEqual(2);
+      expect(result.error.length).toBeGreaterThan(0);
+    }
+  });
+
+  it('validates a nested field reached through a union (header value must be string)', () => {
+    expect(validateFieldValue('mcpServers.foo.headers.Authorization', 'Bearer xyz')).toEqual({
+      success: true,
+    });
+    const bad = validateFieldValue('mcpServers.foo.headers.Authorization', 42);
+    expect(bad.success).toBe(false);
+  });
+});
+
+/* ---------------------------------------------------------------------------
+ * Regression — resolveSubSchema must keep walking through synthetic unions.
+ * The anyOfSchema wrapper used to drop _def.options, so the second segment
+ * after a multi-candidate union could not be resolved and validateFieldValue
+ * silently passed everything under unioned objects.
+ * -----------------------------------------------------------------------*/
+
+describe('resolveSubSchema — traversal through synthesized union', () => {
+  it('walks into a nested field after a union with multiple candidates', () => {
+    const schema = z3.object({
+      payload: z3.union([
+        z3.object({ headers: z3.record(z3.string(), z3.string()) }),
+        z3.object({ headers: z3.record(z3.string(), z3.string()) }),
+      ]),
+    });
+    const sub = resolveSubSchema(schema, ['payload', 'headers', 'Authorization']);
+    expect(sub).not.toBeNull();
+    const safeParse = (sub as { safeParse?: (v: unknown) => { success: boolean } }).safeParse;
+    expect(typeof safeParse).toBe('function');
+    expect(safeParse!('Bearer xyz').success).toBe(true);
+    expect(safeParse!(42).success).toBe(false);
+  });
 });
 
 /* ---------------------------------------------------------------------------
@@ -634,8 +777,26 @@ describe('validateFieldValue', () => {
  *    that LibreChat would reject at startup
  * -----------------------------------------------------------------------*/
 
+/** Per-path sample overrides for fields whose schema applies stricter
+ *  validation than the generic control sample (URLs, host:port, etc.). */
+const SAMPLE_OVERRIDES: Record<string, unknown> = {
+  'cloudfront.domain': 'https://example.com',
+  'cloudfront.cookieDomain': '.example.com',
+  'mcpSettings.allowedAddresses': ['localhost:11434'],
+  'actions.allowedAddresses': ['localhost:11434'],
+  'endpoints.allowedAddresses': ['localhost:11434'],
+  'endpoints.agents.remoteApi.auth.oidc.issuer': 'https://example.com',
+  'endpoints.agents.remoteApi.auth.oidc.jwksUri': 'https://example.com/.well-known/jwks.json',
+  'summarization.trigger': { type: 'token_ratio', value: 0.5 },
+  'skillSync.github.intervalMinutes': 5,
+  'skillSync.github.sources': [
+    { id: 'sample', owner: 'foo', repo: 'bar', paths: ['skills/'], credentialKey: 'sample-key' },
+  ],
+};
+
 /** Generates a representative value that a given UI control would produce. */
-function sampleValueForControl(field: t.SchemaField): unknown {
+function sampleValueForControl(field: t.SchemaField, path?: string): unknown {
+  if (path && path in SAMPLE_OVERRIDES) return SAMPLE_OVERRIDES[path];
   const control = getControlType(field);
   switch (control) {
     case 'toggle':
@@ -733,7 +894,7 @@ describe('control → value → safeParse round-trip (real configSchema)', () =>
     const control = getControlType(field);
 
     it(`${path} (${field.type} → ${control}): sample value passes safeParse`, () => {
-      const value = sampleValueForControl(field);
+      const value = sampleValueForControl(field, path);
 
       const sub = resolveSubSchema(realConfigSchema, path.split('.'));
       if (!sub) return;
@@ -857,9 +1018,8 @@ describe('YAML-editor fallback audit', () => {
  * Custom endpoint validation and schema extraction
  * -----------------------------------------------------------------------*/
 
-const ldpEndpoint = (
-  require3('librechat-data-provider') as { endpointSchema: ZodV3Schema }
-).endpointSchema;
+const ldpEndpoint = (require3('librechat-data-provider') as { endpointSchema: ZodV3Schema })
+  .endpointSchema;
 
 describe('custom endpoint schema', () => {
   const endpointTree = extractSchemaTree(ldpEndpoint);
@@ -931,6 +1091,198 @@ describe('resolveSubSchema for endpoints', () => {
   });
 });
 
+describe('parseIndexedArrayPath', () => {
+  it('accepts numeric suffixes when the parent path is an array', () => {
+    expect(parseIndexedArrayPath('endpoints.custom.0')).toEqual({
+      arrayPath: 'endpoints.custom',
+      index: 0,
+    });
+  });
+
+  it('rejects numeric suffixes when the parent path is a record', () => {
+    expect(parseIndexedArrayPath('mcpServers.foo.headers.2024')).toBeNull();
+  });
+});
+
+describe('toConfigArraySource', () => {
+  it('converts legacy numeric-key array objects to arrays', () => {
+    expect(
+      toConfigArraySource({
+        0: { name: 'first' },
+        2: { name: 'third' },
+      }),
+    ).toEqual([{ name: 'first' }, undefined, { name: 'third' }]);
+  });
+
+  it('rejects non-index object keys', () => {
+    expect(toConfigArraySource({ 0: 'zero', current: 'not-array' })).toBeUndefined();
+  });
+});
+
+describe('mergeConfigArraySources', () => {
+  it('overlays legacy numeric-key overrides onto inherited arrays', () => {
+    expect(
+      mergeConfigArraySources(
+        [
+          { name: 'base-a', baseURL: 'https://a.example.com' },
+          { name: 'base-b', baseURL: 'https://b.example.com' },
+          { name: 'base-c', baseURL: 'https://c.example.com' },
+        ],
+        {
+          1: { name: 'scope-b', baseURL: 'https://scope.example.com' },
+        },
+        undefined,
+      ),
+    ).toEqual([
+      { name: 'base-a', baseURL: 'https://a.example.com' },
+      { name: 'scope-b', baseURL: 'https://scope.example.com' },
+      { name: 'base-c', baseURL: 'https://c.example.com' },
+    ]);
+  });
+
+  it('treats real arrays as complete overrides', () => {
+    expect(mergeConfigArraySources(['base-a', 'base-b'], ['scope-only'], undefined)).toEqual([
+      'scope-only',
+    ]);
+  });
+
+  it('applies pending numeric-key entries after scoped overlays', () => {
+    expect(
+      mergeConfigArraySources(['base-a', 'base-b', 'base-c'], { 1: 'scope-b' }, { 2: 'pending-c' }),
+    ).toEqual(['base-a', 'scope-b', 'pending-c']);
+  });
+});
+
+describe('normalizeAppServiceKeys', () => {
+  it('maps MCP AppService output to canonical mcpServers records', () => {
+    const normalized = normalizeAppServiceKeys({
+      mcpConfig: {
+        filesystem: {
+          type: 'stdio',
+          args: ['server.js', '--root', '/tmp'],
+        },
+      },
+    });
+    expect(normalized).not.toHaveProperty('mcpConfig');
+    expect(normalized.mcpServers).toEqual({
+      filesystem: {
+        type: 'stdio',
+        args: ['server.js', '--root', '/tmp'],
+      },
+    });
+  });
+
+  it('maps Azure groupMap output to canonical groups arrays', () => {
+    const normalized = normalizeAppServiceKeys({
+      endpoints: {
+        azureOpenAI: {
+          isValid: true,
+          groupMap: {
+            default: { apiKey: 'key-a', instanceName: 'instance-a' },
+            fallback: { apiKey: 'key-b', instanceName: 'instance-b' },
+          },
+          errors: ['ignored'],
+          modelNames: ['ignored'],
+        },
+      },
+    });
+    expect(normalized.endpoints).toEqual({
+      azureOpenAI: {
+        groups: [
+          { group: 'default', apiKey: 'key-a', instanceName: 'instance-a' },
+          { group: 'fallback', apiKey: 'key-b', instanceName: 'instance-b' },
+        ],
+      },
+    });
+  });
+});
+
+describe('mergeIndexedArrayEntriesIntoBase', () => {
+  it('merges indexed MCP array edits from AppService fallback aliases', () => {
+    const mergedPaths = new Set<string>();
+    const result = mergeIndexedArrayEntriesIntoBase(
+      [{ fieldPath: 'mcpServers.filesystem.args.1', value: '--workspace' }],
+      {
+        mcpConfig: {
+          filesystem: {
+            type: 'stdio',
+            args: ['server.js', '--root', '/tmp'],
+          },
+        },
+      },
+      mergedPaths,
+    );
+
+    expect(result).toEqual([
+      {
+        fieldPath: 'mcpServers.filesystem.args',
+        value: ['server.js', '--workspace', '/tmp'],
+      },
+    ]);
+    expect(mergedPaths.has('mcpServers.filesystem.args')).toBe(true);
+  });
+
+  it('preserves legacy numeric-key array objects while merging', () => {
+    const result = mergeIndexedArrayEntriesIntoBase(
+      [
+        {
+          fieldPath: 'endpoints.custom.1',
+          value: { name: 'edited', baseURL: 'https://edited.example.com' },
+        },
+      ],
+      {
+        endpoints: {
+          custom: {
+            0: { name: 'first', baseURL: 'https://first.example.com' },
+            1: { name: 'second', baseURL: 'https://second.example.com' },
+            2: { name: 'third', baseURL: 'https://third.example.com' },
+          },
+        },
+      },
+    );
+
+    expect(result).toEqual([
+      {
+        fieldPath: 'endpoints.custom',
+        value: [
+          { name: 'first', baseURL: 'https://first.example.com' },
+          { name: 'edited', baseURL: 'https://edited.example.com' },
+          { name: 'third', baseURL: 'https://third.example.com' },
+        ],
+      },
+    ]);
+  });
+
+  it('strips secret preview companions from untouched array entries after merging', () => {
+    const result = mergeIndexedArrayEntriesIntoBase(
+      [
+        {
+          fieldPath: 'endpoints.custom.1',
+          value: { name: 'edited', baseURL: 'https://edited.example.com', apiKey: '' },
+        },
+      ],
+      {
+        endpoints: {
+          custom: [
+            { name: 'first', baseURL: 'https://first.example.com', apiKeyPreview: 'sk-...aaaa' },
+            { name: 'second', baseURL: 'https://second.example.com', apiKeyPreview: 'sk-...bbbb' },
+          ],
+        },
+      },
+    );
+
+    expect(result).toEqual([
+      {
+        fieldPath: 'endpoints.custom',
+        value: [
+          { name: 'first', baseURL: 'https://first.example.com' },
+          { name: 'edited', baseURL: 'https://edited.example.com', apiKey: '' },
+        ],
+      },
+    ]);
+  });
+});
+
 describe('validateFieldValue for endpoints', () => {
   const validEndpoint = {
     name: 'TestEndpoint',
@@ -976,6 +1328,18 @@ describe('validateFieldValue for endpoints', () => {
       dropParams: ['stop', 'frequency_penalty'],
     });
     expect(result).toEqual({ success: true });
+  });
+
+  it('includes the full path for nested array validation errors', () => {
+    const result = validateFieldValue('endpoints.custom', [
+      validEndpoint,
+      { ...validEndpoint, models: { fetch: true } },
+    ]);
+
+    expect(result).toEqual({
+      success: false,
+      error: 'endpoints.custom[1].models.default: Required',
+    });
   });
 
   it('gracefully handles unknown deep paths', () => {

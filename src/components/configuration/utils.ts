@@ -1,4 +1,31 @@
 import type * as t from '@/types';
+import { deepSerializeKVPairs, secretPathForPreviewPath, stripSecretPreviewValues } from '@/utils';
+
+const INDEXED_ARRAY_PATH_RE = /^(.+)\.(\d+)$/;
+
+/**
+ * Builds the save payload from touched edits. Only admin-touched paths are
+ * submitted, secret display companion paths are dropped, and display
+ * companion strings nested inside object values are stripped — a masked
+ * display value (`sk-mist...4321`) must never reach the backend as a value.
+ */
+export function buildSavePayload(
+  touchedPaths: ReadonlySet<string>,
+  editedValues: t.FlatConfigMap,
+  schemaPaths: ReadonlySet<string>,
+): t.SavePayload {
+  const touched = [...touchedPaths].filter((p) => p in editedValues);
+  const saves = touched
+    .filter(
+      (p) => editedValues[p] !== undefined && secretPathForPreviewPath(p, schemaPaths) == null,
+    )
+    .map((p) => ({
+      fieldPath: p,
+      value: stripSecretPreviewValues(deepSerializeKVPairs(editedValues[p]), p, schemaPaths),
+    }));
+  const resets = touched.filter((p) => editedValues[p] === undefined);
+  return { touched, saves, resets };
+}
 
 export function inferKVType(v: t.ConfigValue): t.KVValueType {
   if (typeof v === 'boolean') return 'boolean';
@@ -221,6 +248,108 @@ export function hasDescendant(path: string, paths?: Set<string>): boolean {
     if (p.startsWith(prefix)) return true;
   }
   return false;
+}
+
+/** Include the dedicated Langfuse connection in generic configured-state UI. */
+export function withLangfuseConfiguredPath(
+  configuredPaths: Set<string>,
+  configured: boolean,
+): Set<string> {
+  const paths = new Set(configuredPaths);
+  if (configured) paths.add('langfuse.enabled');
+  return paths;
+}
+
+export function isMcpEntryPath(path: string): boolean {
+  if (!path.startsWith('mcpServers.')) return false;
+  const key = path.slice('mcpServers.'.length);
+  return key.length > 0 && !key.includes('.');
+}
+
+export function partitionScopeResetPaths(
+  paths: string[],
+  inheritedMcpKeys: Set<string>,
+): {
+  resetPaths: string[];
+  tombstonePaths: string[];
+} {
+  const resetPaths: string[] = [];
+  const tombstonePaths: string[] = [];
+  for (const path of paths) {
+    const key = path.startsWith('mcpServers.') ? path.slice('mcpServers.'.length) : '';
+    if (isMcpEntryPath(path) && inheritedMcpKeys.has(key)) {
+      tombstonePaths.push(path);
+    } else {
+      resetPaths.push(path);
+    }
+  }
+  return { resetPaths, tombstonePaths };
+}
+
+export function applyConfigEdit(
+  prev: t.FlatConfigMap,
+  path: string,
+  value: t.ConfigValue,
+  baseline: t.FlatConfigMap,
+  baselineIntermediates: Set<string>,
+  baselineContainerPaths: Set<string>,
+): t.FlatConfigMap {
+  const indexMatch = INDEXED_ARRAY_PATH_RE.exec(path);
+  if (indexMatch) {
+    const [, arrayPath, indexStr] = indexMatch;
+    const pendingArray = prev[arrayPath];
+    if (Array.isArray(pendingArray)) {
+      const next = { ...prev };
+      const arr = [...pendingArray];
+      arr[Number(indexStr)] = value;
+      next[arrayPath] = arr;
+      for (const existing of Object.keys(next)) {
+        if (existing.startsWith(`${arrayPath}.`)) delete next[existing];
+      }
+      return next;
+    }
+  }
+
+  const baselineValue = baseline[path];
+  const match =
+    value === baselineValue ||
+    (typeof value === 'object' &&
+      typeof baselineValue === 'object' &&
+      JSON.stringify(value) === JSON.stringify(baselineValue));
+  const isContainerDelete =
+    value === undefined && (baselineIntermediates.has(path) || baselineContainerPaths.has(path));
+  const hasPendingAncestorDelete = (() => {
+    let lastDot = path.lastIndexOf('.');
+    while (lastDot > 0) {
+      const ancestor = path.slice(0, lastDot);
+      if (ancestor in prev && prev[ancestor] === undefined) return true;
+      lastDot = ancestor.lastIndexOf('.');
+    }
+    return false;
+  })();
+  if (match && !isContainerDelete && !hasPendingAncestorDelete) {
+    const next = { ...prev };
+    delete next[path];
+    return next;
+  }
+  const next = { ...prev, [path]: value };
+  if (Array.isArray(value)) {
+    const prefix = `${path}.`;
+    for (const k of Object.keys(next)) {
+      if (k.startsWith(prefix) && INDEXED_ARRAY_PATH_RE.test(k)) delete next[k];
+    }
+  }
+  if (indexMatch) delete next[indexMatch[1]];
+  for (const existing of Object.keys(next)) {
+    if (existing === path) continue;
+    const newIsDescendant = path.startsWith(`${existing}.`);
+    const newIsAncestor = existing.startsWith(`${path}.`);
+    if (newIsDescendant && next[existing] === undefined) continue;
+    if (newIsDescendant || newIsAncestor) {
+      delete next[existing];
+    }
+  }
+  return next;
 }
 
 /**
