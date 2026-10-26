@@ -17,10 +17,10 @@ import {
   roleAssignmentsQueryOptions,
   allRolesQueryOptions,
 } from '@/server';
+import { cn, errorText, notifySuccess, notifyError } from '@/utils';
 import { Avatar, TrashButton } from '@/components/shared';
-import { cn, notifySuccess, notifyError } from '@/utils';
+import { useLocalize, useRefreshScopes } from '@/hooks';
 import { ConfirmDialog } from '@/components/access';
-import { useLocalize } from '@/hooks';
 
 const CONFIRM_TITLE_KEYS: Record<t.RemoveTarget['kind'], string> = {
   role: 'com_users_remove_role_title',
@@ -45,6 +45,7 @@ export function UserDetailDialog({
 }: t.UserDetailDialogProps) {
   const localize = useLocalize();
   const queryClient = useQueryClient();
+  const refreshScopes = useRefreshScopes();
 
   const [view, setView] = useState<'main' | 'add'>('main');
   const [removeTarget, setRemoveTarget] = useState<t.RemoveTarget | null>(null);
@@ -86,10 +87,10 @@ export function UserDetailDialog({
     queryClient.invalidateQueries({ queryKey: ['groups'] });
     queryClient.invalidateQueries({ queryKey: ['roleMembers'] });
     queryClient.invalidateQueries({ queryKey: ['groupMembers'] });
-    queryClient.invalidateQueries({ queryKey: ['availableScopes'] });
+    void refreshScopes();
   };
 
-  const handleError = (err: Error) => notifyError(err.message);
+  const handleError = (err: Error) => notifyError(errorText(err, err.message, localize));
 
   const addRoleMutation = useMutation({
     mutationFn: (role: { id: string; name: string }) => {
@@ -240,6 +241,7 @@ export function UserDetailDialog({
 
               {(canManageRoles || canManageGroups || canAssignConfigs) && (
                 <Button
+                  htmlType="button"
                   type="secondary"
                   label={localize('com_users_add_profiles')}
                   onClick={() => setView('add')}
@@ -501,7 +503,12 @@ function AddProfilesPanel({
         </div>
       )}
       <div className="flex justify-end">
-        <Button type="secondary" label={localize('com_ui_done')} onClick={onDone} />
+        <Button
+          htmlType="button"
+          type="secondary"
+          label={localize('com_ui_done')}
+          onClick={onDone}
+        />
       </div>
     </div>
   );

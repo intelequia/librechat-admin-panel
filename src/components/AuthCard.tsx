@@ -7,7 +7,9 @@ import { Alert, Title, Panel, Button, Separator, TextField, Container } from '@c
 import type * as t from '@/types';
 import { adminLoginFn, adminVerify2FAFn, openIdCheckOptions, openidLoginFn } from '@/server';
 import { InputOTP, InputOTPGroup, InputOTPSlot, InputOTPSeparator } from './InputOTP';
+import { AUTH_ERROR_KEYS, TWO_FACTOR_RESTART_CODES } from '@/constants';
 import { PasswordInput } from './PasswordInput';
+import { toSafeRedirect } from '@/utils';
 import { useLocalize } from '@/hooks';
 
 export function AuthCard({
@@ -57,9 +59,9 @@ export function AuthCard({
     setSsoLoading(true);
     openidLoginFn()
       .then((result) => {
-        if (result.error || !result.authUrl) {
+        if (result.error) {
           setAutoRedirectFailed(true);
-          setGeneralError(result.message || localize('com_auth_sso_redirect_failed'));
+          setGeneralError(localize(AUTH_ERROR_KEYS[result.code]));
           return;
         }
         const authUrl = new URL(result.authUrl);
@@ -112,11 +114,11 @@ export function AuthCard({
       const result = await adminLoginFn({ data: { email, password } });
 
       if (result.error) {
-        setGeneralError(result.message || localize('com_auth_login_failed'));
+        setGeneralError(localize(AUTH_ERROR_KEYS[result.code]));
         return;
       }
 
-      if (result.requires2FA) {
+      if ('requires2FA' in result) {
         if (!result.tempToken) {
           setGeneralError(localize('com_auth_login_failed'));
           return;
@@ -130,7 +132,7 @@ export function AuthCard({
 
       setPassword('');
       await router.invalidate();
-      router.navigate({ to: redirectTo });
+      router.navigate({ href: toSafeRedirect(redirectTo) });
     } catch (error) {
       console.error('Login error:', error);
       setGeneralError(localize('com_auth_unable_connect'));
@@ -155,15 +157,12 @@ export function AuthCard({
       const result = await adminVerify2FAFn({ data: { tempToken, totpCode: code } });
 
       if (result.error) {
-        if (result.expired) {
-          setGeneralError(localize('com_auth_2fa_expired'));
+        setGeneralError(localize(AUTH_ERROR_KEYS[result.code]));
+        setTotpCode('');
+        if (TWO_FACTOR_RESTART_CODES.has(result.code)) {
           setStep('login');
           setTempToken('');
-          setTotpCode('');
-          return;
         }
-        setGeneralError(result.message || localize('com_auth_2fa_invalid_code'));
-        setTotpCode('');
         return;
       }
 
@@ -171,7 +170,7 @@ export function AuthCard({
       setTotpCode('');
       setTempToken('');
       await router.invalidate();
-      router.navigate({ to: redirectTo });
+      router.navigate({ href: toSafeRedirect(redirectTo) });
     } catch (error) {
       console.error('2FA verification error:', error);
       setGeneralError(localize('com_auth_unable_connect'));
@@ -197,12 +196,10 @@ export function AuthCard({
     try {
       const result = await openidLoginFn();
       if (result.error) {
-        setGeneralError(result.message || localize('com_auth_login_failed'));
+        setGeneralError(localize(AUTH_ERROR_KEYS[result.code]));
         return;
       }
-      if (result.authUrl) {
-        window.location.href = result.authUrl;
-      }
+      window.location.href = result.authUrl;
     } catch {
       setGeneralError(localize('com_auth_unable_connect'));
     } finally {
@@ -317,6 +314,7 @@ export function AuthCard({
             />
 
             <Button
+              htmlType="button"
               label={isSubmitting ? localize('com_auth_signing_in') : localize('com_auth_sign_in')}
               type="primary"
               onClick={handleLogin}
@@ -327,6 +325,7 @@ export function AuthCard({
               <>
                 <Separator size="sm" />
                 <Button
+                  htmlType="button"
                   label={
                     ssoLoading
                       ? localize('com_auth_sso_redirecting')

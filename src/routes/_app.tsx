@@ -3,6 +3,7 @@ import { Icon } from '@clickhouse/click-ui';
 import { createFileRoute, Outlet, useRouter, Link, redirect } from '@tanstack/react-router';
 import type { ErrorComponentProps } from '@tanstack/react-router';
 import { useCapabilities, useCommandMenu, useLocalize } from '@/hooks';
+import { ConfigContractProvider } from '@/contexts/ContractContext';
 import { CommandMenu } from '@/components/CommandMenu';
 import { AccessDenied } from '@/components/shared';
 import { SystemCapabilities } from '@/constants';
@@ -19,7 +20,6 @@ const ROUTE_TITLE_KEYS: Record<string, string> = {
   '/help': 'com_help_title',
 };
 
-
 export const Route = createFileRoute('/_app')({
   beforeLoad: async ({ location }) => {
     const result = await verifyAdminTokenFn();
@@ -27,12 +27,14 @@ export const Route = createFileRoute('/_app')({
     if (!result.valid) {
       throw redirect({
         to: '/login',
-        search: { redirect: location.pathname },
+        search: { redirect: location.href },
       });
     }
 
     return { user: result.user };
   },
+  pendingMs: 300,
+  pendingComponent: AppPending,
   component: AppLayout,
   errorComponent: AppError,
   notFoundComponent: AppNotFound,
@@ -78,15 +80,31 @@ function AppLayout() {
   const title = matchedKey ? localize(ROUTE_TITLE_KEYS[matchedKey]) : undefined;
 
   return (
-    <div className="flex h-screen overflow-hidden">
-      <Sidebar user={user} collapsed={sidebarCollapsed} onToggle={toggleSidebar} />
-      <div className="flex min-w-0 flex-1 flex-col">
-        <Header title={title} onSearchClick={() => setOpen(true)} />
-        <main className="flex min-h-0 flex-1 flex-col overflow-auto">
-          <Outlet />
-        </main>
+    <ConfigContractProvider>
+      <div className="flex h-screen overflow-hidden">
+        <Sidebar user={user} collapsed={sidebarCollapsed} onToggle={toggleSidebar} />
+        <div className="flex min-w-0 flex-1 flex-col">
+          <Header title={title} onSearchClick={() => setOpen(true)} />
+          <main className="flex min-h-0 flex-1 flex-col overflow-auto">
+            <Outlet />
+          </main>
+        </div>
+        <CommandMenu open={open} onOpenChange={setOpen} />
       </div>
-      <CommandMenu open={open} onOpenChange={setOpen} />
+    </ConfigContractProvider>
+  );
+}
+
+/** Shell placeholder while the session is verified, instead of a blank page. */
+function AppPending() {
+  const localize = useLocalize();
+  return (
+    <div role="status" aria-busy="true" className="flex h-screen overflow-hidden">
+      <span className="sr-only">{localize('com_ui_loading')}</span>
+      <div className="w-14 shrink-0 border-r border-(--cui-color-stroke-default) bg-(--cui-color-background-panel)" />
+      <div className="flex min-w-0 flex-1 flex-col">
+        <div className="h-15.25 shrink-0 border-b border-(--cui-color-stroke-default) bg-(--cui-color-background-panel)" />
+      </div>
     </div>
   );
 }

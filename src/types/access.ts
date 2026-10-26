@@ -1,14 +1,12 @@
 import type { AdminGroup } from '@librechat/data-schemas';
 import type { Role, RolePermissions } from './role';
 
-
 export interface AccessPageProps {
   activeTab: 'groups' | 'roles';
   onTabChange: (tab: string) => void;
   canReadRoles: boolean;
   canReadGroups: boolean;
 }
-
 
 export interface ConfirmDialogProps {
   open: boolean;
@@ -52,7 +50,6 @@ export interface GroupsTabProps {
   onCreateGroup: () => void;
 }
 
-
 export interface RolePermissionsPanelProps {
   permissions: RolePermissions;
   onChange: (permissions: RolePermissions) => void;
@@ -61,4 +58,13 @@ export interface RolePermissionsPanelProps {
 
 export interface RolesTabProps {
   onCreateRole: () => void;
+}
+
+/** The note under a role's name while it is renamed and the role has a configuration profile. */
+export interface RenameProfileNoteProps {
+  id: string;
+  /** The role's current name, which its profile is stored under. */
+  name: string;
+  /** LibreChat moves the profile with the role (`roleRenameMovesProfile`). */
+  moves: boolean;
 }

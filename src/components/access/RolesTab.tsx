@@ -10,7 +10,7 @@ import {
   TrashButton,
 } from '@/components/shared';
 import { deleteRoleFn, allRolesQueryOptions, ROLES_PAGE_SIZE } from '@/server';
-import { useCapabilities, useLocalize } from '@/hooks';
+import { useLocalize, useCapabilities, useRefreshScopes } from '@/hooks';
 import { notifySuccess, notifyError } from '@/utils';
 import { EditRoleDialog } from './EditRoleDialog';
 import { SystemCapabilities } from '@/constants';
@@ -19,6 +19,7 @@ import { ConfirmDialog } from './ConfirmDialog';
 export function RolesTab({ onCreateRole }: t.RolesTabProps) {
   const localize = useLocalize();
   const queryClient = useQueryClient();
+  const refreshScopes = useRefreshScopes();
   const { hasCapability } = useCapabilities();
   const canManage = hasCapability(SystemCapabilities.MANAGE_ROLES);
   const [editTarget, setEditTarget] = useState<t.Role | null>(null);
@@ -51,7 +52,7 @@ export function RolesTab({ onCreateRole }: t.RolesTabProps) {
     mutationFn: (role: t.Role) => deleteRoleFn({ data: { id: role.id } }),
     onSuccess: (_data, role) => {
       queryClient.invalidateQueries({ queryKey: ['roles'] });
-      queryClient.invalidateQueries({ queryKey: ['availableScopes'] });
+      void refreshScopes();
       queryClient.invalidateQueries({ queryKey: ['roleAssignments'] });
       queryClient.invalidateQueries({ queryKey: ['roleMembers'] });
       notifySuccess(localize('com_toast_role_deleted', { name: role.name }));
@@ -80,6 +81,7 @@ export function RolesTab({ onCreateRole }: t.RolesTabProps) {
           placeholder={localize('com_access_search_roles')}
         />
         <Button
+          htmlType="button"
           type="secondary"
           iconLeft="plus"
           label={localize('com_access_create_role')}
@@ -108,7 +110,7 @@ export function RolesTab({ onCreateRole }: t.RolesTabProps) {
               <button
                 type="button"
                 onClick={() => setEditTarget(role)}
-                className="-my-2 -ml-2 min-w-0 flex-1 cursor-pointer rounded py-3 pl-3 text-left outline-none focus-visible:outline-1 focus-visible:-outline-offset-1 focus-visible:outline-(--cui-color-outline)"
+                className="-my-2 -ml-2 min-w-0 flex-1 cursor-pointer rounded py-3 pl-3 text-left outline-none focus-visible:outline-1 focus-visible:-outline-offset-1 focus-visible:outline-(--cui-color-outline) focus-visible:outline-solid"
               >
                 <div className="flex items-center gap-2">
                   <span className="text-sm font-medium text-(--cui-color-text-default) hover:underline">
