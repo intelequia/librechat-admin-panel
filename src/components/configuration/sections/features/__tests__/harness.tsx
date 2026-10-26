@@ -2,6 +2,8 @@ import { vi } from 'vitest';
 import { useMemo, useState } from 'react';
 import { act, render } from '@testing-library/react';
 import { configSchema } from 'librechat-data-provider';
+import { QueryClientProvider } from '@tanstack/react-query';
+import type { QueryClient } from '@tanstack/react-query';
 import type { ComponentType } from 'react';
 import type * as t from '@/types';
 import {
@@ -15,7 +17,9 @@ import {
 } from '@/utils';
 import { extractSchemaTree, extractSchemaDefaults, getSchemaPathSet } from '@/server/config';
 import { ConfigValuesProvider } from '@/contexts/ConfigValuesContext';
+import { ConfigContractContext } from '@/contexts/ContractContext';
 import { RowFilterContext } from '@/contexts/RowFilterContext';
+import { BUNDLED_CONFIG_CONTRACT } from '@/constants';
 
 const TREE = extractSchemaTree(configSchema as t.ZodSchemaLike);
 const SCHEMA_PATHS = getSchemaPathSet();
@@ -41,6 +45,10 @@ interface SectionSetup {
   /** Data paths the tab filter matches. */
   filter?: string[];
   props?: Partial<t.FieldRendererProps>;
+  /** Admin config features the server reports (none: an older server). */
+  features?: Partial<t.ConfigFeatures>;
+  /** The page's query client, with the server reads a test seeds (none: nothing is fetched). */
+  client?: QueryClient;
 }
 
 function withoutKey<T>(record: Record<string, T>, key: string): Record<string, T> {
@@ -78,6 +86,10 @@ export function renderSection(Component: ComponentType<t.FieldRendererProps>, se
   };
   const configuredPaths = new Set([...collectLeafPaths(yaml), ...collectLeafPaths(overrides)]);
   const filter = setup.filter ? createPathIndex(setup.filter) : null;
+  const contract: t.ConfigContract = {
+    ...BUNDLED_CONFIG_CONTRACT,
+    features: { ...BUNDLED_CONFIG_CONTRACT.features, ...setup.features },
+  };
   let newSession = () => {};
 
   function Page() {
@@ -133,15 +145,24 @@ export function renderSection(Component: ComponentType<t.FieldRendererProps>, se
       ...setup.props,
     };
     return (
-      <ConfigValuesProvider value={values}>
-        <RowFilterContext.Provider value={filter}>
-          <Component {...props} />
-        </RowFilterContext.Provider>
-      </ConfigValuesProvider>
+      <ConfigContractContext.Provider value={contract}>
+        <ConfigValuesProvider value={values}>
+          <RowFilterContext.Provider value={filter}>
+            <Component {...props} />
+          </RowFilterContext.Provider>
+        </ConfigValuesProvider>
+      </ConfigContractContext.Provider>
     );
   }
 
   /** Discards every pending edit and starts a new edit session, as Discard does on the page. */
   const startNewSession = () => act(() => newSession());
-  return { ...render(<Page />), ...spies, startNewSession };
+  const page = setup.client ? (
+    <QueryClientProvider client={setup.client}>
+      <Page />
+    </QueryClientProvider>
+  ) : (
+    <Page />
+  );
+  return { ...render(page), ...spies, startNewSession };
 }

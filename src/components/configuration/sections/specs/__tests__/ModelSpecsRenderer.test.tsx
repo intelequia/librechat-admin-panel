@@ -7,10 +7,14 @@ import type * as t from '@/types';
 import {
   baseConfigFixture,
   baseLayersFixture,
+  scopeConfigFixture,
   scopeLayersFixture,
   valuesDataFixture,
 } from '@/test/layers';
 import { CollectionEditsContext } from '@/contexts/CollectionEditsContext';
+import { ConfigContractContext } from '@/contexts/ContractContext';
+import { createServerContract } from '@/test/fixtures';
+import { BUNDLED_CONFIG_CONTRACT } from '@/constants';
 import { ConfigValuesProvider } from '@/contexts/ConfigValuesContext';
 import { RowFilterContext } from '@/contexts/RowFilterContext';
 import { ModelSpecsRenderer } from '../ModelSpecsRenderer';
@@ -57,22 +61,29 @@ function renderSpecs(
     data,
     collectionEdits = {},
     showConfiguredOnly,
+    contract = BUNDLED_CONFIG_CONTRACT,
+    outside = {},
   }: {
     onChange?: t.FieldRendererProps['onChange'];
     data?: t.ConfigValuesData;
     collectionEdits?: t.CollectionEdits;
     showConfiguredOnly?: boolean;
+    contract?: t.ConfigContract;
+    /** Values outside `modelSpecs` the settings read (`interface.modelSelect`). */
+    outside?: t.FlatConfigMap;
   } = {},
 ) {
   const values = data ?? valuesDataFixture(baseLayersFixture());
   const wrap = (children: ReactNode) => (
-    <CollectionEditsContext.Provider value={collectionEdits}>
-      <ConfigValuesProvider
-        value={{ ...values, configValues: { ...values.configValues, modelSpecs } }}
-      >
-        {children}
-      </ConfigValuesProvider>
-    </CollectionEditsContext.Provider>
+    <ConfigContractContext.Provider value={contract}>
+      <CollectionEditsContext.Provider value={collectionEdits}>
+        <ConfigValuesProvider
+          value={{ ...values, configValues: { ...values.configValues, modelSpecs } }}
+        >
+          {children}
+        </ConfigValuesProvider>
+      </CollectionEditsContext.Provider>
+    </ConfigContractContext.Provider>
   );
   const ui = (
     <ModelSpecsRenderer
@@ -80,6 +91,7 @@ function renderSpecs(
       parentPath="modelSpecs"
       parentValue={modelSpecs}
       getValue={(path, fallback) => {
+        if (path in outside) return outside[path];
         const key = path.slice('modelSpecs.'.length);
         return key in modelSpecs ? modelSpecs[key] : fallback;
       }}
@@ -250,6 +262,40 @@ describe('ModelSpecsRenderer', () => {
     expect(onChange).toHaveBeenCalledWith('modelSpecs.addedEndpoints', ['openAI']);
   });
 
+  it('matches an endpoint spelled as written once the server folds endpoint names', () => {
+    const values = valuesDataFixture(baseLayersFixture());
+    const data: t.ConfigValuesData = {
+      ...values,
+      configValues: {
+        ...values.configValues,
+        endpoints: { custom: [{ name: 'Ollama', baseURL: 'http://127.0.0.1:11434/v1' }] },
+      },
+    };
+    const optionsOf = () =>
+      [
+        ...(
+          document.getElementById('modelSpecs-addedEndpoints-add') as HTMLSelectElement
+        ).querySelectorAll('option'),
+      ].map((option) => [option.value, option.textContent]);
+    const before = renderSpecs({ list: SPECS, addedEndpoints: ['Ollama'] }, { data });
+    expect(
+      screen.getByText('com_config_specs_added_served_as {"name":"Ollama","served":"ollama"}'),
+    ).toBeInTheDocument();
+    expect(optionsOf()).toContainEqual(['ollama', 'Ollama (ollama)']);
+    before.unmount();
+    renderSpecs(
+      { list: SPECS, addedEndpoints: ['Ollama'] },
+      { data, contract: createServerContract({}, { titleResolution: 'field' }) },
+    );
+    expect(screen.queryByText(/com_config_specs_added_served_as/)).not.toBeInTheDocument();
+    const chip = screen.getByRole('button', {
+      name: 'com_config_specs_chip_remove {"name":"Ollama"}',
+    }).parentElement;
+    expect(chip).toHaveTextContent('Ollama');
+    expect(chip).toHaveAttribute('title', 'Ollama');
+    expect(optionsOf().map(([value]) => value)).not.toContain('ollama');
+  });
+
   it('flags spec problems on the row and at the field', () => {
     renderSpecs({
       list: [...SPECS, { name: 'gpt', label: 'Copy', preset: { endpoint: 'Nope', model: 'm' } }],
@@ -341,6 +387,55 @@ describe('ModelSpecsRenderer', () => {
     fireEvent.click(screen.getByRole('button', { name: /com_config_ce_override_for/ }));
     expect(screen.getByRole('button', { name: 'com_config_specs_add' })).toHaveFocus();
     expect(screen.getByText(/com_config_specs_customizing/)).toBeInTheDocument();
+  });
+
+  it('names the specs a profile hides with the endpoints they select (keyedTombstones)', () => {
+    const specs = [...SPECS, { name: 'gw', label: 'Gateway spec', preset: { endpoint: 'GPT' } }];
+    const base = baseConfigFixture({ dbOverrides: { modelSpecs: { list: specs } } });
+    const scope = scopeConfigFixture({ tombstones: ['endpoints.custom["GPT"]'] });
+    const data = valuesDataFixture(scopeLayersFixture(scope, base, true));
+    const keyed = createServerContract({ keyedTombstones: true });
+    const { unmount } = renderSpecs({ list: specs }, { data, contract: keyed });
+    expect(
+      screen.getByText(/com_config_specs_hidden_endpoint .*"specs":"Gateway spec"/),
+    ).toBeInTheDocument();
+    expect(document.body.textContent).toContain('com_config_specs_preview_specs {\\"count\\":1}');
+    unmount();
+    renderSpecs({ list: specs }, { data });
+    expect(screen.queryByText(/com_config_specs_hidden_endpoint/)).toBeNull();
+    expect(document.body.textContent).toContain('com_config_specs_preview_specs {\\"count\\":2}');
+  });
+
+  it('leaves the added endpoints a profile hides out of "Users will see" (keyedTombstones)', () => {
+    const base = baseConfigFixture({
+      dbOverrides: { modelSpecs: { list: SPECS, addedEndpoints: ['GPT'] } },
+    });
+    const scope = scopeConfigFixture({ tombstones: ['endpoints.custom["GPT"]'] });
+    const data = valuesDataFixture(scopeLayersFixture(scope, base, true));
+    const keyed = createServerContract({ keyedTombstones: true });
+    const { unmount } = renderSpecs(
+      { list: SPECS, addedEndpoints: ['GPT'] },
+      { data, contract: keyed },
+    );
+    expect(document.body.textContent).toContain('com_config_specs_preview_added_none');
+    unmount();
+    renderSpecs({ list: SPECS, addedEndpoints: ['GPT'] }, { data });
+    expect(document.body.textContent).not.toContain('com_config_specs_preview_added_none');
+    expect(document.body.textContent).toContain('com_config_specs_preview_added');
+  });
+
+  it("warns that a profile hiding every spec's endpoint leaves its members nothing to pick (keyedTombstones)", () => {
+    const specs = [{ name: 'gw', label: 'Gateway spec', preset: { endpoint: 'GPT' } }];
+    const base = baseConfigFixture({ dbOverrides: { modelSpecs: { list: specs } } });
+    const scope = scopeConfigFixture({ tombstones: ['endpoints.custom["GPT"]'] });
+    const data = valuesDataFixture(scopeLayersFixture(scope, base, true));
+    const keyed = createServerContract({ keyedTombstones: true });
+    const { unmount } = renderSpecs({ list: specs }, { data, contract: keyed });
+    expect(document.body.textContent).toContain('com_config_specs_preview_none_menu_off');
+    expect(document.body.textContent).toContain('com_config_specs_empty_menu_off');
+    unmount();
+    renderSpecs({ list: specs }, { data });
+    expect(document.body.textContent).not.toContain('com_config_specs_empty_menu_off');
   });
 
   it('says an inherited endpoint list cannot be emptied in a profile (D3)', () => {
@@ -530,6 +625,40 @@ describe('ModelSpecsRenderer', () => {
     expect(document.getElementById('modelSpecs-list-1-preset-topK')).not.toBeNull();
     expect(document.getElementById('modelSpecs-list-1-preset-top_p')).toBeNull();
     expect(document.getElementById('modelSpecs-list-1-preset-frequency_penalty')).toBeNull();
+  });
+});
+
+describe('the endpoint menu with no layer setting it', () => {
+  /** librechat.yaml has one spec and no `modelSelect`: LibreChat turned the menu off at startup. */
+  const yamlEffective: t.ConfigRecord = {
+    interface: { modelSelect: false },
+    modelSpecs: { list: [SPECS[0]] },
+  };
+  const data = valuesDataFixture(
+    baseLayersFixture(
+      baseConfigFixture({
+        config: yamlEffective,
+        yamlConfig: yamlEffective,
+        yamlPaths: ['modelSpecs.list'],
+        dbOverrides: {},
+      }),
+    ),
+  );
+  const outside = { 'interface.modelSelect': false };
+
+  it('keeps the value LibreChat derived at startup before it derives it again', () => {
+    renderSpecs({ list: [] }, { data, outside });
+    expect(screen.getByText('com_config_specs_empty_menu_off')).toBeTruthy();
+  });
+
+  it('follows the specs shown where LibreChat derives it again (specInterfaceRederive)', () => {
+    const contract = createServerContract({ specInterfaceRederive: true });
+    const { unmount } = renderSpecs({ list: [] }, { data, outside, contract });
+    expect(screen.queryByText('com_config_specs_empty_menu_off')).toBeNull();
+    expect(screen.getByText('com_config_specs_preview_none')).toBeTruthy();
+    unmount();
+    renderSpecs({ list: SPECS, addedEndpoints: ['openAI'] }, { data, outside, contract });
+    expect(screen.queryByText(/com_config_specs_added_menu_off/)).toBeNull();
   });
 });
 

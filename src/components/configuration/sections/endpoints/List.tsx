@@ -1,7 +1,8 @@
 import { useEffect, useRef } from 'react';
 import type * as t from '@/types';
-import { DecorativeIcon, KebabMenu } from '@/components/shared';
-import { useLocalize, useValuesScope } from '@/hooks';
+import { DecorativeIcon, KebabMenu, WarningList } from '@/components/shared';
+import { useLocalize, useValuesScope, useCatalogEndpoint } from '@/hooks';
+import { CATALOG_ENDPOINT_REASON_KEYS } from '@/constants';
 import { sourceLabel } from '../../values';
 import { describeIssue } from './issues';
 import { isUnserved } from './model';
@@ -127,6 +128,26 @@ export function StatusBadge({ issues }: { issues: t.EndpointIssue[] }) {
   );
 }
 
+/**
+ * "Not served" for a saved endpoint LibreChat does not serve the edit
+ * target's users, from the scope catalog (`catalogApi`) with its reason: a
+ * key the merge dropped, say, which the list's own checks can't see. Nothing
+ * while the row has unsaved changes or problems of its own, or without the catalog.
+ */
+function ServedBadge({ row }: t.EndpointServedBadgeProps) {
+  const localize = useLocalize();
+  const entry = useCatalogEndpoint(row.identity ?? '');
+  const ownErrors = row.issues.some((issue) => issue.severity === 'error');
+  if (!entry || entry.enabled || row.isNew || row.edited || ownErrors) return null;
+  return (
+    <Badge
+      tone="error"
+      label={localize('com_config_ce_status_not_served')}
+      description={localize(CATALOG_ENDPOINT_REASON_KEYS[entry.reason ?? 'unknown'])}
+    />
+  );
+}
+
 /** "New" or "Edited" for an endpoint with unsaved changes. */
 function PendingBadge({ row }: { row: t.EndpointRow }) {
   const localize = useLocalize();
@@ -158,24 +179,24 @@ function rowDetails(row: t.EndpointRow, localize: t.LocalizeFn): string {
   return parts.join(' · ');
 }
 
+/** Why an endpoint the layer beneath defines can't be deleted, pointing at Hide where the row offers it. */
+function deleteLockKey(row: t.EndpointRow, hides: boolean): string {
+  if (row.origin !== 'inherited') return 'com_config_ce_delete_locked';
+  return hides
+    ? 'com_config_ce_delete_locked_inherited_hide'
+    : 'com_config_ce_delete_locked_inherited';
+}
+
 /** Whether a row can be deleted here: endpoints the layer beneath defines can't (D1). */
 export function isDeletable(row: Pick<t.EndpointRow, 'origin'>): boolean {
   return row.origin === 'admin' || row.origin === 'scope';
 }
 
 /** A saved endpoint a pending edit removes: struck through, with Undo (D9). */
-function RemovalRow({
-  removal,
-  disabled,
-  onUndo,
-}: {
-  removal: t.EndpointRemoval;
-  disabled?: boolean;
-  onUndo: (removal: t.EndpointRemoval) => void;
-}) {
+function RemovalRow({ removal, disabled, onUndo, notes }: t.EndpointRemovalRowProps) {
   const localize = useLocalize();
   return (
-    <li className="flex items-center gap-3 rounded-lg border border-dashed border-(--cui-color-stroke-default) px-3 py-2">
+    <li className="flex flex-wrap items-center gap-3 rounded-lg border border-dashed border-(--cui-color-stroke-default) px-3 py-2">
       <Monogram title={removal.title} muted />
       <span className="flex min-w-0 flex-1 flex-col">
         <span
@@ -200,6 +221,7 @@ function RemovalRow({
           {localize('com_config_ctl_entry_undo')}
         </button>
       )}
+      {notes && <WarningList notes={notes} />}
     </li>
   );
 }
@@ -220,6 +242,7 @@ function EndpointListRow({
   onDelete,
   onRevert,
   override,
+  hide,
 }: t.EndpointListRowProps) {
   const localize = useLocalize();
   const rowRef = useRef<HTMLLIElement>(null);
@@ -253,6 +276,17 @@ function EndpointListRow({
       onClick: () => onRevert(row),
     });
   }
+  const hides = !disabled && hide?.offers(row) === true;
+  if (hide && hides) {
+    const reason = hide.disabledReason(row);
+    menu.push({
+      label: hide.label,
+      icon: 'eye-closed',
+      disabled: reason !== undefined,
+      title: reason,
+      onClick: () => hide.onSelect(row),
+    });
+  }
   if (!disabled) {
     const deletable = isDeletable(row);
     menu.push({
@@ -260,13 +294,7 @@ function EndpointListRow({
       icon: 'trash',
       danger: deletable,
       disabled: !deletable,
-      title: deletable
-        ? undefined
-        : localize(
-            row.origin === 'inherited'
-              ? 'com_config_ce_delete_locked_inherited'
-              : 'com_config_ce_delete_locked',
-          ),
+      title: deletable ? undefined : localize(deleteLockKey(row, hides)),
       onClick: () => onDelete(row),
     });
   }
@@ -295,6 +323,7 @@ function EndpointListRow({
           <SourceBadge row={row} />
           <PendingBadge row={row} />
           <StatusBadge issues={row.issues} />
+          <ServedBadge row={row} />
         </div>
         <span
           id={detailsId}
@@ -336,7 +365,9 @@ export function EndpointList({
   onDelete,
   onRevert,
   override,
+  hide,
   onUndoRemoval,
+  removalNotes,
   idPrefix,
 }: t.EndpointListProps) {
   const localize = useLocalize();
@@ -359,6 +390,7 @@ export function EndpointList({
             removal={item.removal}
             disabled={disabled}
             onUndo={onUndoRemoval}
+            notes={removalNotes?.(item.removal)}
           />
         ) : (
           <EndpointListRow
@@ -370,6 +402,7 @@ export function EndpointList({
             onOpen={onOpen}
             onReveal={onReveal}
             override={override}
+            hide={hide}
             onDelete={onDelete}
             onRevert={onRevert}
           />

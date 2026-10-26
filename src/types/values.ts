@@ -3,6 +3,7 @@ import type { PrincipalType } from 'librechat-data-provider';
 import type { ReactNode } from 'react';
 import type { ConfigValue, ConfigRecord, FlatConfigMap } from './config';
 import type { VisibilityEdit } from './changes';
+import type { ConfigRules, ConfigWriteRules } from './contract';
 
 /**
  * Where a field's value comes from (WS4):
@@ -37,10 +38,17 @@ export interface FieldLayer {
 
 /** A field whose own value is ignored because another path takes precedence (WS4, EV-8). */
 export interface ShadowedBy {
+  /** The setting that wins: Global's own field, or for `pair` the other half, which Global sets. */
   path: string;
+  /** What this field gets from Global (`undefined` where Global leaves it unset). */
   value: ConfigValue;
-  /** `block`: the whole other block wins, even where it leaves this field unset (titles); `field`: only a value it sets wins. */
-  precedence?: 'block' | 'field';
+  /**
+   * `block`: the whole other block wins, even where it leaves this field unset
+   * (titles, `titleResolution: 'block'`); `field`: only a value it sets wins;
+   * `pair`: it sets the other half of a choice made together (the title
+   * endpoint and model, `titleResolution: 'field'`), so it wins here too.
+   */
+  precedence?: 'block' | 'field' | 'pair';
 }
 
 /** Everything a field row needs to render its value and state (WS4; `error` from WS1). */
@@ -111,6 +119,14 @@ export interface ValueLayers {
   baseTombstones: ReadonlySet<string>;
   /** The open profile, or null in base mode. */
   scope: ScopeLayer | null;
+  /**
+   * The layer beneath the edit target (librechat.yaml for Base, Base for a
+   * profile) as the target's own values merge over it, where LibreChat
+   * applies the target's removals inside entries by key (`keyedTombstones`):
+   * without the values they remove. What removing one of the target's own
+   * values inside such an entry goes back to. Absent: the layer as it is.
+   */
+  beneath?: ConfigRecord | null;
   /** What the edit target's users get: `base`, or Base merged with the open profile. */
   effective: ConfigRecord | null;
 }
@@ -132,6 +148,10 @@ export interface ConfigValuesData {
   layers?: ValueLayers | null;
   /** Pending profile Hide/Unhide by path: a row shows what Save will do. */
   visibilityEdits?: Readonly<Record<string, VisibilityEdit>>;
+  /** The server's write rules: which sections it reads only from librechat.yaml. */
+  writeRules?: ConfigWriteRules;
+  /** How the server applies `endpoints.all` title settings (`block` when absent). */
+  titleResolution?: ConfigRules['titleResolution'];
 }
 
 /** Props of `ConfigValuesProvider` (WS4). */
@@ -203,15 +223,37 @@ export interface BaseConfigData {
   dbOverrides?: ConfigRecord;
   /** Paths the base overrides remove from librechat.yaml. */
   dbTombstones: string[];
+  /**
+   * The base document's revision (`expectedRevision`): `null` when there is
+   * none, absent when the server does not report revisions.
+   */
+  dbRevision?: string | null;
   schemaDefaults: FlatConfigMap;
   /** MCP servers defined in librechat.yaml. */
   yamlMcpKeys?: string[];
   yamlMcpServers?: Record<string, ConfigValue>;
 }
 
-/** An admin config document as the API returns it, including its tombstones. */
+/**
+ * What the panel reads in place of values the server derives from
+ * librechat.yaml and the profiles above it (`normalizeAppServiceKeys`), so
+ * edits are diffed against what is configured rather than what it resolves to.
+ */
+export interface ConfiguredValues {
+  /** The config as written: librechat.yaml, with the layers the config holds merged over it. */
+  written: ConfigRecord;
+  /** The Azure groups as written, not the `groupMap` they resolve to (`editsAzureGroups`). */
+  azureGroups: boolean;
+  /** Custom endpoints' `customParams` as written, not expanded (`customParamsExpansion`). */
+  compactParams: boolean;
+}
+
+/**
+ * An admin config document as the API returns it, including its tombstones
+ * and (`expectedRevision`) its revision, `<id>:<configVersion>`.
+ */
 export interface AdminConfigDocResponse {
-  config: AdminConfig & Pick<Config, 'tombstones'>;
+  config: AdminConfig & Pick<Config, 'tombstones'> & { revision?: string };
 }
 
 /** One profile's own config document (WS4). */
@@ -224,6 +266,11 @@ export interface ResolvedConfigData {
   overrides: ConfigRecord;
   /** Paths the profile hides from what it inherits. */
   tombstones: string[];
+  /**
+   * The profile document's revision (`expectedRevision`): `null` when there is
+   * none, absent when the server does not report revisions.
+   */
+  revision?: string | null;
 }
 
 /** One setting of a read-only summary: its label ("Group › Setting"), display text and data path. */

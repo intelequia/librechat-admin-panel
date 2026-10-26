@@ -1,13 +1,13 @@
 import { useRef, useState, useEffect, useContext, useLayoutEffect } from 'react';
 import type { ReactNode } from 'react';
 import type * as t from '@/types';
+import { useDraftValue, useListKeys, useLocalize, useConfigKeyProblem } from '@/hooks';
 import { RowProblemsContext } from '@/contexts/RowProblemsContext';
-import { useDraftValue, useListKeys, useLocalize } from '@/hooks';
 import { AddItemButton, TrashButton } from '@/components/shared';
-import { cn, isBlankText, isUnsafeConfigKey } from '@/utils';
-import { BLOCK_UNSAFE_CONFIG_KEYS } from '@/constants';
+import { RemovedKeyRow } from './RemovedKeyRow';
 import { TextareaField } from './TextareaField';
 import { SelectField } from './SelectField';
+import { cn, isBlankText } from '@/utils';
 import { INPUT_CLASSES } from './display';
 import { FieldNotice } from './Notice';
 
@@ -20,6 +20,12 @@ const TYPE_LABEL_KEYS: Record<t.KVValueType, string> = {
 };
 const NUMERIC = /^-?\d+(\.\d+)?([eE][-+]?\d+)?$/;
 const pairKey = (pair: t.KeyValuePair) => pair.key;
+
+/** A removed inherited value as its row shows it. */
+function removedValueText(value: t.ConfigValue): string {
+  if (value === undefined) return '';
+  return typeof value === 'string' ? value : JSON.stringify(value);
+}
 
 /** Value type for typed text: numbers, true/false and JSON objects/arrays are recognized. */
 export function inferTypeFromText(raw: string, allowed: readonly t.KVValueType[]): t.KVValueType {
@@ -118,9 +124,11 @@ export function KeyValueField({
   keyPlaceholder,
   valuePlaceholder,
   lockedKeys,
+  keyRemoval,
   'aria-label': ariaLabel,
 }: t.KeyValueFieldProps) {
   const localize = useLocalize();
+  const unsafeKeyProblem = useConfigKeyProblem();
   const availableTypes = valueTypes ?? DEFAULT_TYPES;
   const keys = useListKeys({ items: pairs, identity: pairKey, prefix: `${id}-row` });
   const [drafts, setDrafts] = useState<Array<{ id: number; pair: t.KeyValuePair }>>([]);
@@ -230,9 +238,8 @@ export function KeyValueField({
     if (isDraft && key === '' && !isBlankText(pair.value)) {
       return localize('com_config_ctl_kv_key_missing');
     }
-    if (BLOCK_UNSAFE_CONFIG_KEYS && isUnsafeConfigKey(key)) {
-      return localize('com_config_unsafe_key_error');
-    }
+    const unsafe = unsafeKeyProblem(key);
+    if (unsafe) return unsafe;
     const taken = isDraft ? pairs.some((existing) => existing.key === key) : isTaken(key, index);
     if (key !== '' && taken) return localize('com_config_ctl_kv_duplicate');
     return null;
@@ -350,6 +357,28 @@ export function KeyValueField({
     const problem = keyProblem(pair, isDraft ? undefined : index);
     const rowLabel = isBlankText(pair.key) ? `${localize('com_ui_entry')} ${index + 1}` : pair.key;
     const isLocked = !isDraft && (lockedKeys?.has(pair.key) ?? false);
+    /**
+     * A key the value still has is listed as removed only while its removal
+     * is pending. One with a saved removal is a value the target sets again
+     * itself (or adds back): not locked, its Delete removes it, and the
+     * saved removal applies again.
+     */
+    const removal = isDraft ? undefined : keyRemoval?.removed.get(pair.key);
+    const toggleRemoval = keyRemoval?.onToggle;
+    if (removal?.state === 'pending') {
+      return (
+        <RemovedKeyRow
+          key={rowId}
+          name={pair.key}
+          value={pair.value}
+          state={removal.state}
+          disabled={disabled}
+          onToggle={toggleRemoval && (() => toggleRemoval(pair.key))}
+        />
+      );
+    }
+    const removable =
+      isLocked && removal === undefined && toggleRemoval && keyRemoval?.canRemove(pair.key);
     return (
       <div
         key={rowId}
@@ -383,6 +412,12 @@ export function KeyValueField({
             <TrashButton
               onClick={handlers.onRemove}
               ariaLabel={`${localize('com_ui_delete')} ${rowLabel}`}
+            />
+          )}
+          {!disabled && removable && (
+            <TrashButton
+              onClick={() => toggleRemoval(pair.key)}
+              ariaLabel={localize('com_config_ctl_kv_remove_inherited', { key: pair.key })}
             />
           )}
         </div>
@@ -432,6 +467,20 @@ export function KeyValueField({
     ),
   ];
 
+  /** Inherited keys removed by a saved tombstone: the value no longer has them, so they are listed apart. */
+  const removedRows = [...(keyRemoval?.removed ?? [])]
+    .filter(([key]) => !pairs.some((pair) => pair.key === key))
+    .map(([key, removal]) => (
+      <RemovedKeyRow
+        key={`removed-${key}`}
+        name={key}
+        value={removedValueText(removal.value)}
+        state={removal.state}
+        disabled={disabled}
+        onToggle={keyRemoval?.onToggle && (() => keyRemoval.onToggle?.(key))}
+      />
+    ));
+
   return (
     <div
       ref={listRef}
@@ -441,7 +490,8 @@ export function KeyValueField({
       aria-label={ariaLabel}
     >
       {rows}
-      {pairs.length === 0 && drafts.length === 0 && disabled && (
+      {removedRows}
+      {pairs.length === 0 && drafts.length === 0 && removedRows.length === 0 && disabled && (
         <span role="listitem" className="text-sm text-(--cui-color-text-muted)">
           {localize('com_config_ctl_list_empty')}
         </span>

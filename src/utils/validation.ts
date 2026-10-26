@@ -1,8 +1,9 @@
 import { configSchema } from 'librechat-data-provider';
 import type * as t from '@/types';
+import { AZURE_GROUPS_PATH, RUNTIME_NUMBER_LIMITS } from '@/constants';
 import { getValueAtPath, isConfigRecord } from './format';
-import { RUNTIME_NUMBER_LIMITS } from '@/constants';
 import { resolveSubSchema } from './schema';
+import { getEntryKey } from './collections';
 
 const MAX_UNION_DEPTH = 10;
 
@@ -112,6 +113,8 @@ const ISSUE_MESSAGES: Readonly<Record<string, string>> = {
   too_big_items: 'must have at most {{maximum}} items',
   union_dropped_key: "isn't valid for this kind of value",
   duplicate_merge_key: 'repeats a name another entry already uses',
+  entry_key_unaddressable:
+    'is named "{{name}}", which LibreChat could not remove or hide later: use at most {{max}} characters, not starting with $ or __, and not constructor or prototype',
   missing_merge_key: 'needs a name',
   indexed_merge_key_write: 'must be saved as a whole list',
   invalid_document: 'is not a valid configuration',
@@ -124,7 +127,79 @@ const ISSUE_MESSAGES: Readonly<Record<string, string>> = {
     'can only be configured in librechat.yaml for process-backed MCP servers (command, args, env, cwd, stderr, stdio)',
   BLANK_VALUE: 'is blank: enter a value, or clear the field',
   BLANK_KEY: 'has a blank key: name it, or remove the entry',
+  UNSAFE_KEY:
+    "has a key LibreChat can't store yet (\"{{key}}\" contains '.' or starts with '$'); set it in librechat.yaml",
+  RESERVED_KEY:
+    "has a key LibreChat can't store (\"{{key}}\" starts with '$' or is a reserved name); rename it",
+  invalid_value: 'is not a valid value',
+  wrong_type: 'has the wrong type of value',
+  invalid_option: 'is not one of the allowed values',
+  too_small_value: 'is too small',
+  too_big_value: 'is too large',
+  dotted_key: "has a key with a dot where LibreChat expects a setting's name",
+  unknown_section: "isn't a section LibreChat knows",
+  not_multiple_of: 'must be a multiple of {{multipleOf}}',
+  custom_empty: 'is empty: enter a host and a port',
+  custom_format: 'must be only host:port, without http:// or a path',
+  custom_missing_port: 'must include a port, for example localhost:11434',
+  custom_public_ip:
+    'is a public IP address: enter a private address, or a hostname that resolves to one',
+  secret_reentry_required:
+    'must be entered again: LibreChat does not send a stored key to a new destination',
+  env_reference_not_allowed:
+    'references an environment variable LibreChat does not let admin settings read',
+  MCP_API_KEY_MISSING:
+    'must be entered: this server sends an API key you provide for everyone. Enter it, or let each user provide their own',
+  MCP_SECRET_NOT_CARRIED:
+    "must be entered again: the one stored for {{from}} can't move to a new name",
+  TOO_MANY_CHANGES:
+    'has {{count}} changes, more than the {{limit}} LibreChat takes in one save: save some of them first, then the rest',
+  azure_base_url_required: 'is required for a serverless group',
+  azure_instance_required: 'is required unless the group is serverless',
+  azure_model_unresolved:
+    "include {{model}}, which has no deployment name or API version of its own or the group's",
+  azure_model_duplicate: 'include {{model}}, which group {{group}} serves already',
+  invalid_azure_groups:
+    "don't resolve: a model is served twice or lacks a deployment name or API version, a group lacks its instance or base URL, or a key references a variable that isn't set",
+  invalid_vertex_config:
+    "isn't a Vertex AI setup LibreChat can load: a variable isn't set, a project ID, region or deployment name isn't one URL path segment, or librechat.yaml configures no Vertex AI",
+  invalid_param_definitions:
+    "aren't parameter definitions LibreChat can load: each key must be a parameter of the chosen parameter set",
+  unknown_spec_endpoint: "isn't a built-in endpoint or a configured custom endpoint",
+  spec_endpoint_hidden:
+    "is {{endpoint}}, which this profile hides: LibreChat refuses a spec for it until it's shown again",
 };
+
+/**
+ * Codes whose message needs parameters, worded without them: the admin API
+ * reports issue codes only (no minimum, expected type or options).
+ */
+const PARAMLESS_CODES: Readonly<Record<string, string>> = {
+  invalid_type: 'wrong_type',
+  invalid_literal: 'invalid_value',
+  invalid_enum_value: 'invalid_option',
+  too_small: 'too_small_value',
+  too_small_exclusive: 'too_small_value',
+  too_small_length: 'too_small_value',
+  too_small_items: 'too_small_value',
+  too_big: 'too_big_value',
+  too_big_exclusive: 'too_big_value',
+  too_big_length: 'too_big_value',
+  too_big_items: 'too_big_value',
+};
+
+const PLACEHOLDER_RE = /\{\{\w+\}\}/;
+
+/**
+ * The code to show for an issue reported without parameters: one whose
+ * message names them (`too_small`: "must be at least {{minimum}}") becomes
+ * its parameter-free wording ("is too small"); other codes stay.
+ */
+export function paramlessIssueCode(code: string): string {
+  const template = ISSUE_MESSAGES[code];
+  if (!template || !PLACEHOLDER_RE.test(template)) return code;
+  return PARAMLESS_CODES[code] ?? 'invalid_value';
+}
 
 /** Fills `{{param}}` placeholders. */
 export function interpolateIssue(
@@ -187,6 +262,68 @@ function classifySchemaIssue(issue: t.SchemaIssue): {
     default:
       return { code: issue.code, params: {} };
   }
+}
+
+/** A bound the admin API reported as a number, or undefined (dates and bigints are not sent). */
+function numberBound(value: number | undefined): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+/**
+ * The issue code and message parameters of an issue the admin API reported
+ * with `params` (`issueParams`): its bounds, options and expected type, read
+ * the way the panel reads its own schema issues; a refinement's `reason`
+ * becomes `custom_<reason>` where the panel words it. Without params, or
+ * without the parameter a code's message needs, the code is worded without
+ * it (`paramlessIssueCode`).
+ */
+export function classifyReportedIssue(
+  code: string,
+  params: t.ReportedIssueParams | undefined,
+): { code: string; params?: Record<string, string | number> } {
+  if (!params) return { code: paramlessIssueCode(code) };
+  const bound = numberBound(code === 'too_big' ? params.maximum : params.minimum);
+  switch (code) {
+    case 'too_small':
+    case 'too_big':
+      if (bound === undefined) return { code: paramlessIssueCode(code) };
+      break;
+    case 'invalid_type':
+    case 'invalid_literal':
+      if (params.expected === undefined) return { code: paramlessIssueCode(code) };
+      break;
+    case 'invalid_enum_value':
+    case 'invalid_union_discriminator':
+      if (!params.options?.length) return { code: paramlessIssueCode('invalid_enum_value') };
+      return {
+        code: 'invalid_enum_value',
+        params: { options: params.options.map((option) => JSON.stringify(option)).join(', ') },
+      };
+    case 'not_multiple_of': {
+      const step = numberBound(params.multipleOf);
+      return step === undefined
+        ? { code: 'invalid_value' }
+        : { code, params: { multipleOf: step } };
+    }
+    case 'custom': {
+      const reasonCode = params.reason ? `custom_${params.reason}` : undefined;
+      return { code: reasonCode && reasonCode in ISSUE_MESSAGES ? reasonCode : code };
+    }
+    default:
+      break;
+  }
+  return classifySchemaIssue({
+    code,
+    path: [],
+    message: '',
+    expected: params.expected,
+    received: params.received,
+    minimum: bound,
+    maximum: bound,
+    inclusive: params.inclusive,
+    type: params.type,
+    validation: params.validation,
+  });
 }
 
 /** Config issues (stable codes, English messages) for schema issues relative to `basePath`. */
@@ -275,6 +412,86 @@ export function validateLoadableEndpoint(
     ...(hasText(entry.baseURL) ? [] : [issue('baseURL', 'required')]),
     ...(hasModels ? [] : [issue('models.default', 'models_required')]),
   ];
+}
+
+function azureIssue(
+  base: string,
+  entryPath: string,
+  code: string,
+  identity: string | undefined,
+  params: Record<string, string> = {},
+): t.ConfigIssue {
+  return {
+    path: `${base}.${entryPath}`,
+    code,
+    params,
+    message: describeIssueCode(code, params, code),
+    entryIdentity: identity,
+    entryPath,
+  };
+}
+
+/** Why one model of a non-serverless group can't be mapped: no deployment name or API version, its own or the group's. */
+function isUnresolvedModel(model: t.ConfigValue, group: t.ConfigRecord): boolean {
+  const groupDeployment = hasText(group.deploymentName);
+  const groupVersion = hasText(group.version);
+  if (typeof model === 'boolean') return !groupDeployment || !groupVersion;
+  const config = isConfigRecord(model) ? model : {};
+  return (
+    (!hasText(config.deploymentName) && !groupDeployment) ||
+    (!hasText(config.version) && !groupVersion)
+  );
+}
+
+/** Each model the merged Azure groups serve, with the groups that serve it. */
+export function modelsByGroup(groups: t.ConfigValue): Map<string, string[]> {
+  const served = new Map<string, string[]>();
+  for (const group of Array.isArray(groups) ? groups : []) {
+    const name = getEntryKey(group, 'group');
+    const models = isConfigRecord(group) ? group.models : undefined;
+    if (name === undefined || !isConfigRecord(models)) continue;
+    for (const model of Object.keys(models)) {
+      served.set(model, [...(served.get(model) ?? []), name]);
+    }
+  }
+  return served;
+}
+
+/**
+ * What an Azure group needs for LibreChat to resolve it (`validateAzureGroups`;
+ * the server refuses a write whose groups don't, `invalid_azure_groups`): a
+ * serverless group a base URL, any other an instance name and, for each
+ * model, a deployment name and an API version (its own or the group's); and
+ * no model another group also serves (`servedBy`: each model's groups).
+ */
+export function validateResolvableGroup(
+  entry: t.ConfigValue,
+  index: number,
+  identity: string | undefined,
+  servedBy: ReadonlyMap<string, readonly string[]>,
+): t.ConfigIssue[] {
+  if (!isConfigRecord(entry)) return [];
+  const base = `${AZURE_GROUPS_PATH}.${index}`;
+  const models = isConfigRecord(entry.models) ? entry.models : {};
+  const issues: t.ConfigIssue[] = [];
+  const serverless = entry.serverless === true;
+  if (serverless && !hasText(entry.baseURL)) {
+    issues.push(azureIssue(base, 'baseURL', 'azure_base_url_required', identity));
+  }
+  if (!serverless && !hasText(entry.instanceName)) {
+    issues.push(azureIssue(base, 'instanceName', 'azure_instance_required', identity));
+  }
+  for (const [model, config] of Object.entries(models)) {
+    const owner = servedBy.get(model)?.find((group) => group !== identity);
+    if (owner !== undefined) {
+      issues.push(
+        azureIssue(base, 'models', 'azure_model_duplicate', identity, { model, group: owner }),
+      );
+    } else if (!serverless && isUnresolvedModel(config, entry)) {
+      issues.push(azureIssue(base, 'models', 'azure_model_unresolved', identity, { model }));
+    }
+  }
+  return issues;
 }
 
 /**

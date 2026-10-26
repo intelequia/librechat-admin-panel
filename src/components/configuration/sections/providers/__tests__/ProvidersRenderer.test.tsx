@@ -5,7 +5,10 @@ import { fireEvent, render, screen, within } from '@testing-library/react';
 import type { ReactNode } from 'react';
 import type * as t from '@/types';
 import { ConfigValuesProvider } from '@/contexts/ConfigValuesContext';
+import { ConfigContractContext } from '@/contexts/ContractContext';
 import { ProvidersRenderer } from '../ProvidersRenderer';
+import { createServerContract } from '@/test/fixtures';
+import { BUNDLED_CONFIG_CONTRACT } from '@/constants';
 import { extractSchemaTree } from '@/server/config';
 import { getValueAtPath } from '@/utils';
 
@@ -54,15 +57,23 @@ const STATUS: t.EndpointStatusMap = {
   agents: { name: 'agents', custom: false, userProvide: false },
 };
 
-function renderProviders(overrides: Partial<t.FieldRendererProps> = {}) {
+function renderProviders(
+  overrides: Partial<t.FieldRendererProps> = {},
+  titleResolution?: t.ConfigRules['titleResolution'],
+  contract: t.ConfigContract = BUNDLED_CONFIG_CONTRACT,
+  seed?: (client: QueryClient) => void,
+) {
   const client = new QueryClient();
   client.setQueryData(['endpointStatus', 0], STATUS);
   client.setQueryData(['endpointModels', 0], { openAI: ['gpt-5-mini', 'gpt-5'] });
+  seed?.(client);
   const onChange = vi.fn();
-  const values: t.ConfigValuesData = { configValues: CONFIG, editedValues: {} };
+  const values: t.ConfigValuesData = { configValues: CONFIG, editedValues: {}, titleResolution };
   const wrapper = ({ children }: { children: ReactNode }) => (
     <QueryClientProvider client={client}>
-      <ConfigValuesProvider value={values}>{children}</ConfigValuesProvider>
+      <ConfigContractContext.Provider value={contract}>
+        <ConfigValuesProvider value={values}>{children}</ConfigValuesProvider>
+      </ConfigContractContext.Provider>
     </QueryClientProvider>
   );
   const utils = render(
@@ -108,6 +119,76 @@ describe('ProvidersRenderer', () => {
     expect(within(card('all')).queryByText(/com_config_providers_status_/)).toBeNull();
   });
 
+  it("reads status from the scope catalog, with why a provider is not served and its env names' status", () => {
+    const contract = createServerContract({ catalogApi: true, envStatus: true });
+    const { container } = renderProviders({}, undefined, contract, (client) => {
+      client.setQueryData(['configCatalog', 'role', '__base__'], {
+        status: { anthropic: { name: 'anthropic', custom: false, userProvide: false } },
+        endpoints: {
+          anthropic: { enabled: true, custom: false, envVars: ['ANTHROPIC_API_KEY'] },
+          google: {
+            enabled: false,
+            custom: false,
+            envVars: ['GOOGLE_KEY', 'GOOGLE_SERVICE_KEY_FILE'],
+            reason: 'not_listed',
+          },
+        },
+        models: { anthropic: ['claude-opus-5-5', 'claude-haiku-4-5'] },
+      });
+      client.setQueryData(['envStatus'], {
+        GOOGLE_KEY: { set: true, userProvided: false, sources: ['endpoint'] },
+        GOOGLE_SERVICE_KEY_FILE: { set: false, userProvided: false, sources: ['endpoint'] },
+      });
+    });
+    expect(within(card('anthropic')).getByText('com_config_providers_status_active')).toBeTruthy();
+    expect(within(card('openAI')).getByText('com_config_providers_status_disabled')).toBeTruthy();
+    const badge = card('google').querySelector('.provider-status') as HTMLElement;
+    expect(badge.getAttribute('title')).toContain('com_config_providers_reason_not_listed');
+    fireEvent.click(trigger('google'));
+    const row = card('google').querySelector('.provider-status-row') as HTMLElement;
+    expect(within(row).getByText(/com_config_providers_reason_not_listed/)).toBeTruthy();
+    expect(within(row).queryByText('com_config_providers_status_endpoints_note')).toBeNull();
+    const env = [...row.querySelectorAll('[data-env-state]')].map((item) => [
+      item.querySelector('code')?.textContent,
+      item.getAttribute('data-env-state'),
+    ]);
+    expect(env).toEqual([
+      ['GOOGLE_KEY', 'set'],
+      ['GOOGLE_SERVICE_KEY_FILE', 'unset'],
+    ]);
+    expect(row.querySelector('[data-env-state="unset"]')?.textContent).toContain(
+      'com_config_env_state_unset_optional',
+    );
+    fireEvent.click(trigger('anthropic'));
+    const anthropic = card('anthropic').querySelector('.provider-status-row') as HTMLElement;
+    expect(within(anthropic).getByText(/com_config_providers_status_models/)).toBeTruthy();
+    expect(container.querySelectorAll('[data-env-state="unreported"]')).toHaveLength(1);
+  });
+
+  it('reads status from the end-user routes on a server whose meta leaves catalogApi out', () => {
+    const contract = createServerContract({ envStatus: true });
+    const { container } = renderProviders({}, undefined, contract, (client) => {
+      client.setQueryData(['configCatalog', 'role', '__base__'], {
+        status: { anthropic: { name: 'anthropic', custom: false, userProvide: false } },
+        endpoints: {
+          google: { enabled: false, custom: false, envVars: ['GOOGLE_KEY'], reason: 'not_listed' },
+        },
+      });
+      client.setQueryData(['envStatus'], {
+        GOOGLE_KEY: { set: true, userProvided: false, sources: ['endpoint'] },
+      });
+    });
+    expect(within(card('openAI')).getByText('com_config_providers_status_active')).toBeTruthy();
+    expect(
+      within(card('anthropic')).getByText('com_config_providers_status_disabled'),
+    ).toBeTruthy();
+    fireEvent.click(trigger('google'));
+    const row = card('google').querySelector('.provider-status-row') as HTMLElement;
+    expect(within(row).queryByText(/com_config_providers_reason_/)).toBeNull();
+    expect(within(row).getByText('com_config_providers_status_endpoints_note')).toBeTruthy();
+    expect(container.querySelectorAll('[data-env-state]')).toHaveLength(0);
+  });
+
   it('summarizes a collapsed card, flagging values Global takes precedence over', () => {
     renderProviders();
     const summary = card('openAI').querySelector('.settings-help') as HTMLElement;
@@ -131,6 +212,18 @@ describe('ProvidersRenderer', () => {
     const titles = document.getElementById('section-endpoints.openAI-titles') as HTMLElement;
     expect(within(titles).getByText(/com_config_providers_global_titles_banner/)).toBeTruthy();
     expect(within(titles).getByText('com_config_providers_summary_ignored')).toBeTruthy();
+  });
+
+  it('leaves title settings to each provider on a server that resolves them per field', () => {
+    renderProviders({}, 'field');
+    const summary = card('openAI').querySelector('.settings-help') as HTMLElement;
+    expect(summary.textContent).toContain('gpt-5-mini');
+    expect(summary.textContent).not.toContain('com_config_providers_summary_shadowed_ignored');
+    expect(card('all').textContent).toContain('com_config_providers_global_desc_field');
+    fireEvent.click(trigger('openAI'));
+    const titles = document.getElementById('section-endpoints.openAI-titles') as HTMLElement;
+    expect(within(titles).queryByText(/com_config_providers_global_titles_banner/)).toBeNull();
+    expect(within(titles).queryByText('com_config_providers_summary_ignored')).toBeNull();
   });
 
   it('opens Agent features first, with capability descriptions and paired limits', () => {
@@ -221,6 +314,19 @@ describe('ProvidersRenderer', () => {
       }),
     ).toBeTruthy();
     expect(document.getElementById('endpoints-azureOpenAI-groups')).toHaveClass('azure-groups');
+  });
+
+  it('calls a stored Azure groups override stale, unless the server applies it (azureGroupSecrets)', () => {
+    const overrides = { dbOverridePaths: new Set(['endpoints.azureOpenAI.groups']) };
+    const { unmount } = renderProviders(overrides);
+    fireEvent.click(trigger('azureOpenAI'));
+    expect(screen.getByText('com_config_providers_azure_stale')).toBeTruthy();
+    unmount();
+    renderProviders(overrides, undefined, createServerContract({ azureGroupSecrets: true }));
+    fireEvent.click(trigger('azureOpenAI'));
+    expect(screen.getByText('com_config_providers_azure_readonly_applied')).toBeTruthy();
+    expect(screen.getByText('com_config_providers_azure_override_applied')).toBeTruthy();
+    expect(screen.queryByText('com_config_providers_azure_stale')).toBeNull();
   });
 
   it('keeps unsaved values of unset settings reachable when only set values are shown', () => {

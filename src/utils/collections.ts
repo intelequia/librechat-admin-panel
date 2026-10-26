@@ -1,16 +1,45 @@
 import type * as t from '@/types';
 import { isConfigRecord, getValueAtPath, isConfigValueEqual } from './format';
-import { KEYED_COLLECTIONS } from '@/constants';
+import { KEYED_COLLECTIONS, BUNDLED_CONFIG_RULES } from '@/constants';
 
 type UpsertEntryOp = Extract<t.EntryChange, { op: 'upsertEntry' }>;
 type RemoveEntryOp = Extract<t.EntryChange, { op: 'removeEntry' }>;
 
 /** Object paths LibreChat replaces whole instead of merging (its `ATOMIC_MERGE_PATHS`, in YAML keys). */
-const ATOMIC_MERGE_PATHS: ReadonlySet<string> = new Set(['interface.theme']);
+const ATOMIC_MERGE_PATHS: ReadonlySet<string> = new Set(BUNDLED_CONFIG_RULES.atomicMergePaths);
 
 /** The keyed collection stored at exactly `path`. */
 export function getKeyedCollection(path: string): t.KeyedCollection | undefined {
   return KEYED_COLLECTIONS.get(path);
+}
+
+/**
+ * Whether the server merges a collection entry by entry, so each entry a
+ * target stores is one override: a `byKey` list, a gated one (Azure groups)
+ * only where the panel edits it entry by entry (`gate`).
+ */
+export function mergesByKey(collection: t.KeyedCollection, features: t.ConfigFeatures): boolean {
+  if (collection.merge !== 'byKey') return false;
+  return collection.gate?.(features) ?? true;
+}
+
+/** The lists the server merges entry by entry, by path (`mergesByKey`): saving one never takes over the whole list. */
+export function mergedListPaths(features: t.ConfigFeatures): ReadonlySet<string> {
+  return new Set(
+    [...KEYED_COLLECTIONS.values()]
+      .filter((collection) => mergesByKey(collection, features))
+      .map((collection) => collection.path),
+  );
+}
+
+/**
+ * The location of a named entry (`mcpServers.github`, `endpoints.custom.Moonshot`),
+ * by the name LibreChat serves a keyed collection's entry under, so two
+ * spellings of one entry are one location (`endpoints.custom.ollama` for `Ollama`).
+ */
+export function entryLocation(path: string, name: string): string {
+  const servedName = KEYED_COLLECTIONS.get(path)?.servedName;
+  return `${path}.${servedName ? servedName(name) : name}`;
 }
 
 /**
@@ -89,6 +118,16 @@ export function getEntryKey(entry: t.ConfigValue, key: string): string | undefin
   return typeof value === 'string' && value !== '' ? value : undefined;
 }
 
+/** A list's entries by identity (their `key` field); entries without one are left out. */
+export function entriesByKey(list: t.ConfigValue, key: string): Map<string, t.ConfigValue> {
+  return new Map(
+    (Array.isArray(list) ? list : []).flatMap((entry) => {
+      const identity = getEntryKey(entry, key);
+      return identity === undefined ? [] : [[identity, entry] as const];
+    }),
+  );
+}
+
 /** Position of the entry with identity `identity` in a list (-1 when absent or not a list). */
 export function findEntryIndex(list: t.ConfigValue, key: string, identity: string): number {
   return Array.isArray(list) ? indexOfKey(list, key, identity) : -1;
@@ -102,12 +141,31 @@ function indexOfKey(entries: t.ConfigValue[], key: string, value: string): numbe
   return entries.findIndex((entry) => getEntryKey(entry, key) === value);
 }
 
+/**
+ * `lower` without its secret where `upper` holds one of its own: a key, or
+ * the preview a stored key reads back as. A key and its preview travel
+ * together, and LibreChat sends the upper entry's key, so the lower entry's
+ * (a librechat.yaml `${VAR}`) never shows beside it.
+ */
+export function withoutShadowedSecret(
+  lower: t.ConfigRecord,
+  upper: t.ConfigRecord,
+  collection: t.KeyedCollection,
+): t.ConfigRecord {
+  const secret = collection.secret;
+  if (!secret || !(secret.key in lower || secret.preview in lower)) return lower;
+  if (!suppliesSecret(upper, collection) && !hasHiddenSecret(upper, collection)) return lower;
+  const { [secret.key]: _key, [secret.preview]: _preview, ...rest } = lower;
+  return rest;
+}
+
 function mergeEntriesByKey(
   lower: t.ConfigValue[],
   upper: t.ConfigValue[],
-  key: string,
+  collection: t.KeyedCollection,
   path: string,
 ): t.ConfigValue[] {
+  const { key } = collection;
   const upperByKey = new Map<string, t.ConfigValue>();
   for (const item of upper) {
     const id = getEntryKey(item, key);
@@ -119,7 +177,11 @@ function mergeEntriesByKey(
     const override = id === undefined ? undefined : upperByKey.get(id);
     if (id === undefined || override === undefined) return item;
     seen.add(id);
-    return mergeConfigLayers(item, override, path);
+    const below =
+      isConfigRecord(item) && isConfigRecord(override)
+        ? withoutShadowedSecret(item, override, collection)
+        : item;
+    return mergeConfigLayers(below, override, path);
   });
   for (const [id, item] of upperByKey) {
     if (!seen.has(id)) result.push(mergeConfigLayers({}, item, path));
@@ -147,7 +209,7 @@ export function mergeConfigLayers(
   }
   const collection = KEYED_COLLECTIONS.get(path);
   if (collection?.merge === 'byKey' && Array.isArray(lower) && Array.isArray(upper)) {
-    return mergeEntriesByKey(lower, upper, collection.key, path);
+    return mergeEntriesByKey(lower, upper, collection, path);
   }
   return upper;
 }
@@ -217,6 +279,8 @@ interface ResolveState {
   pendingRenames: Set<string>;
   /** The temporary key of each entry moved aside until its own rename (`moveAside`). */
   aside: Map<string, string>;
+  /** Renames whose stored secret the server carries (`carriesSecrets`). */
+  renames: t.EntryRename[];
 }
 
 const ASIDE_KEY_PREFIX = '\u0000aside:';
@@ -403,6 +467,18 @@ function hasKey(state: ResolveState, lowerEntries: t.ConfigValue[], name: string
   return indexOfKey(state.entries, key, name) >= 0 || indexOfKey(lowerEntries, key, name) >= 0;
 }
 
+/**
+ * Whether the server can move the stored secret of entry `identity` to its
+ * new name `name` (`carriesSecrets`): a plain rename, not one that swaps or
+ * chains names with another entry of the batch, which a `rename` change
+ * applied in order can't express.
+ */
+function carriesSecret(state: ResolveState, identity: string, name: string): boolean {
+  return (
+    state.input.carriesSecrets === true && !state.aside.has(identity) && !state.aside.has(name)
+  );
+}
+
 function upsertByKey(
   op: UpsertEntryOp,
   state: ResolveState,
@@ -451,15 +527,18 @@ function upsertByKey(
       return;
     }
     if (hiddenSecrets.has(identity) && !suppliesSecret(op.value, collection)) {
-      state.issues.push(
-        entryIssue(
-          collection,
-          'SECRET_REQUIRED_FOR_RENAME',
-          identity,
-          `Re-enter the API key to rename "${identity}": its stored key can't be carried over to a new name`,
-        ),
-      );
-      return;
+      if (!carriesSecret(state, identity, op.key)) {
+        state.issues.push(
+          entryIssue(
+            collection,
+            'SECRET_REQUIRED_FOR_RENAME',
+            identity,
+            `Re-enter the API key to rename "${identity}": its stored key can't be carried over to a new name`,
+          ),
+        );
+        return;
+      }
+      state.renames.push({ path: state.input.collection.path, from: identity, to: op.key });
     }
     const renamed = withKey(desiredEntry(op, state.entries[index], state), key, op.key);
     state.entries = state.entries.map((entry, i) => (i === index ? renamed : entry));
@@ -624,7 +703,8 @@ function upsertInList(op: UpsertEntryOp, state: ResolveState): void {
  * defines stores only the keys that differ from it, and an entry left equal
  * to it is dropped from the override. Lower-layer entries cannot be removed
  * or renamed (a merge would bring them back), and a stored entry with an
- * encrypted secret cannot be renamed without a new secret.
+ * encrypted secret cannot be renamed without a new secret, unless the server
+ * moves it (`carriesSecrets`: the rename is then listed in `renames`).
  *
  * `replace` (model specs): the result is the whole list, starting from the
  * target's own list or, without one, the list it inherits; taking over an
@@ -659,6 +739,7 @@ export function resolveCollectionOps(input: t.CollectionOpsInput): t.CollectionR
       ),
     ),
     aside: new Map(),
+    renames: [],
   };
   for (const op of input.ops) {
     if (op.op === 'upsertEntry' && op.identity !== null) state.pendingRenames.delete(op.identity);
@@ -678,6 +759,7 @@ export function resolveCollectionOps(input: t.CollectionOpsInput): t.CollectionR
     issues: state.issues,
     warnings: state.warnings,
     effective: state.effective,
+    renames: state.renames,
   };
 }
 

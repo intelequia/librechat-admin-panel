@@ -7,6 +7,7 @@ import {
   isUsableBaseURL,
   validateEndpoint,
   hasBlockingIssue,
+  addsOpenRouterDefaults,
 } from '../model';
 import { monogram } from '../List';
 
@@ -29,6 +30,21 @@ function codes(input: Partial<t.EndpointValidationInput> & { entry: t.ConfigValu
 describe('validateEndpoint', () => {
   it('accepts a complete endpoint', () => {
     expect(codes({ entry: complete })).toEqual([]);
+  });
+
+  it('refuses a new or renamed name LibreChat could not remove or hide by key', () => {
+    for (const name of ['$proxy', '__proxy', 'constructor', 'x'.repeat(9)]) {
+      expect(codes({ entry: { ...complete, name }, maxKeyLength: 8 })).toEqual([
+        'nameUnaddressable',
+      ]);
+    }
+    expect(
+      codes({ entry: { ...complete, name: '$proxy' }, loadedName: 'Old', maxKeyLength: 8 }),
+    ).toEqual(['nameUnaddressable']);
+    expect(
+      codes({ entry: { ...complete, name: '$proxy' }, loadedName: '$proxy', maxKeyLength: 8 }),
+    ).toEqual([]);
+    expect(codes({ entry: { ...complete, name: '$proxy' } })).toEqual([]);
   });
 
   it('flags a name-only endpoint as not served (custom-08)', () => {
@@ -134,6 +150,14 @@ describe('validateEndpoint', () => {
         loadedName: 'OpenRouter',
       }),
     ).toEqual([]);
+    expect(
+      codes({
+        entry: { ...stored, name: 'Renamed' },
+        storedSecret: true,
+        loadedName: 'OpenRouter',
+        carriesKey: true,
+      }),
+    ).toEqual([]);
   });
 
   it('warns about a base URL that is not a URL, but accepts env references', () => {
@@ -173,5 +197,25 @@ describe('monogram', () => {
     expect(monogram('open_router')).toBe('OR');
     expect(monogram('Mistral')).toBe('MI');
     expect(monogram('(x)')).toBe('X');
+  });
+});
+
+describe('addsOpenRouterDefaults', () => {
+  it("is an endpoint named for OpenRouter or pointing at it, unless another provider's defaults are chosen", () => {
+    expect(addsOpenRouterDefaults({ name: 'OpenRouter' })).toBe(true);
+    expect(addsOpenRouterDefaults({ name: 'Gateway', baseURL: 'https://x/openrouter' })).toBe(true);
+    expect(
+      addsOpenRouterDefaults({
+        name: 'OpenRouter 2',
+        customParams: { defaultParamsEndpoint: 'anthropic' },
+      }),
+    ).toBe(false);
+    expect(
+      addsOpenRouterDefaults({
+        name: 'OpenRouter',
+        customParams: { defaultParamsEndpoint: 'custom' },
+      }),
+    ).toBe(true);
+    expect(addsOpenRouterDefaults({ name: 'Groq', baseURL: 'https://api.groq.com' })).toBe(false);
   });
 });

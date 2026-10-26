@@ -1,5 +1,12 @@
 import { PrincipalType } from 'librechat-data-provider';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import type * as t from '@/types';
+import { describeApiError } from '@/utils';
+
+/** The API client's error wording, without its session layer. */
+function apiErrorBodyMessage(body: t.ApiErrorBody, status: number, fallback: string): string {
+  return describeApiError(body) ?? body.error ?? body.message ?? `${fallback}: ${status}`;
+}
 
 interface FakeResponse {
   ok: boolean;
@@ -20,7 +27,10 @@ function reply(status: number, body: object): FakeResponse {
   return { ok: status >= 200 && status < 300, status, json: async () => body };
 }
 
-vi.mock('../utils/api', () => ({
+vi.mock('../utils/api', async () => ({
+  apiErrorMessage: async (response: Response, fallback: string) =>
+    apiErrorBodyMessage(await response.json(), response.status, fallback),
+  apiErrorBodyMessage,
   apiFetch: vi.fn(async (url: string, init?: { method?: string; body?: string }) => {
     const call = { url, method: init?.method ?? 'GET', body: init?.body };
     calls.push(call);
@@ -38,14 +48,14 @@ vi.mock('../capabilities', () => ({
 
 vi.mock('@tanstack/react-start', () => ({
   createServerFn: () => ({
-    inputValidator: () => ({
+    validator: () => ({
       handler: (fn: (...args: object[]) => object) => fn,
     }),
     handler: (fn: (...args: object[]) => object) => fn,
   }),
 }));
 
-import { createScopeFn, getAvailableScopesFn } from './read';
+import { createScopeFn, setScopePriorityFn, getAvailableScopesFn } from './read';
 
 const BOB = '6ac3e10890468262c2267093';
 const ENG = '6ac3e10d90468262c22670b0';
@@ -65,7 +75,7 @@ const configs = [
     principalId: BOB,
     priority: 100,
     isActive: true,
-    overrides: { interface: { parameters: false } },
+    overrides: { interface: { parameters: false }, webSearch: { tavilyApiKeyPreview: '...5555' } },
     tombstones: ['balance.startBalance'],
   },
   {
@@ -86,7 +96,7 @@ const configs = [
       endpoints: {
         custom: [
           { name: 'Claude', modelDisplayLabel: 'Claude (USER)' },
-          { name: 'Gemini', iconURL: 'https://g.example/i.png' },
+          { name: 'Gemini', iconURL: 'https://g.example/i.png', apiKeyPreview: '...6666' },
         ],
       },
     },
@@ -124,7 +134,7 @@ beforeEach(() => {
 });
 
 describe('getAvailableScopesFn', () => {
-  it('names users with their email, counts members and lists override paths and entries', async () => {
+  it('names users with their email, counts members and lists override paths, entries and stored secrets', async () => {
     const { scopes } = await getAvailableScopesFn();
     expect(scopes).toEqual([
       {
@@ -137,6 +147,8 @@ describe('getAvailableScopesFn', () => {
         isActive: true,
         overridePaths: ['interface.parameters'],
         overrideEntries: {},
+        overrideEntryPaths: {},
+        storedSecrets: [{ path: 'webSearch.tavilyApiKey' }],
         tombstones: ['balance.startBalance'],
       },
       {
@@ -149,6 +161,8 @@ describe('getAvailableScopesFn', () => {
         isActive: false,
         overridePaths: ['mcpServers.docs.type', 'mcpServers.docs.url'],
         overrideEntries: {},
+        overrideEntryPaths: {},
+        storedSecrets: [],
         tombstones: [],
       },
       {
@@ -161,6 +175,12 @@ describe('getAvailableScopesFn', () => {
         isActive: true,
         overridePaths: ['endpoints.custom'],
         overrideEntries: { 'endpoints.custom': ['Claude', 'Gemini'] },
+        overrideEntryPaths: {
+          'endpoints.custom': { Claude: ['modelDisplayLabel'], Gemini: ['iconURL'] },
+        },
+        storedSecrets: [
+          { path: 'apiKey', entry: { collection: 'endpoints.custom', identity: 'Gemini' } },
+        ],
         tombstones: [],
       },
     ]);
@@ -236,5 +256,117 @@ describe('createScopeFn', () => {
     });
     expect(calls.some((c) => c.method === 'PUT')).toBe(false);
     expect(scope).toMatchObject({ _id: 'c-eng', priority: 20, isActive: false });
+  });
+});
+
+describe('createScopeFn with expectedRevision', () => {
+  const created = (call: FakeCall): [number, object] => [
+    201,
+    {
+      config: {
+        _id: 'new',
+        principalType: 'role',
+        principalId: 'EDITORS',
+        priority: JSON.parse(call.body ?? '{}').priority,
+        isActive: true,
+        overrides: {},
+      },
+    },
+  ];
+  const meta = (features: Record<string, boolean>) =>
+    routes.push([/^GET \/api\/admin\/config\/meta$/, () => [200, { features }]]);
+
+  it('creates the profile with one create-only PUT, without reading it or the role first', async () => {
+    meta({ expectedRevision: true, principalCheck: true });
+    routes.push([/^PUT \/api\/admin\/config\/role\/EDITORS$/, created]);
+    const { scope } = await createScopeFn({
+      data: { principalType: PrincipalType.ROLE, principalId: 'EDITORS', name: 'EDITORS' },
+    });
+    expect(scope).toMatchObject({ _id: 'new', priority: 10 });
+    expect(calls.map((c) => `${c.method} ${c.url}`)).toEqual([
+      'GET /api/admin/config/meta',
+      'PUT /api/admin/config/role/EDITORS',
+    ]);
+    expect(JSON.parse(calls[1].body ?? '{}')).toEqual({
+      overrides: {},
+      priority: 10,
+      expectedRevision: 'absent',
+    });
+  });
+
+  it('opens the profile someone created meanwhile instead of replacing it (409)', async () => {
+    meta({ expectedRevision: true, principalCheck: true });
+    routes.push([
+      /^PUT /,
+      () => [409, { code: 'CONFIG_VERSION_CONFLICT', currentRevision: 'c-eng:3' }],
+    ]);
+    routes.push([/^GET \/api\/admin\/config\/group\//, () => [200, { config: configs[2] }]]);
+    const { scope } = await createScopeFn({
+      data: { principalType: PrincipalType.GROUP, principalId: ENG, name: 'Engineering' },
+    });
+    expect(scope).toMatchObject({ _id: 'c-eng', priority: 20 });
+    expect(calls.filter((c) => c.method === 'PUT')).toHaveLength(1);
+  });
+
+  it('says the role does not exist when the server refuses the principal', async () => {
+    meta({ expectedRevision: true, principalCheck: true });
+    routes.push([
+      /^PUT /,
+      () => [404, { error: 'Principal not found', code: 'PRINCIPAL_NOT_FOUND' }],
+    ]);
+    await expect(
+      createScopeFn({
+        data: { principalType: PrincipalType.ROLE, principalId: 'GONE', name: 'GONE' },
+      }),
+    ).rejects.toThrow('There is no role named "GONE"');
+    await expect(
+      createScopeFn({ data: { principalType: PrincipalType.GROUP, principalId: ENG, name: 'E' } }),
+    ).rejects.toThrow(/doesn't exist/);
+  });
+
+  it('still looks the role up first on a server without the principal check', async () => {
+    meta({ expectedRevision: true });
+    await expect(
+      createScopeFn({
+        data: { principalType: PrincipalType.ROLE, principalId: 'NO_SUCH_ROLE', name: 'X' },
+      }),
+    ).rejects.toThrow('There is no role named "NO_SUCH_ROLE"');
+    expect(calls.some((c) => c.method === 'PUT')).toBe(false);
+  });
+});
+
+describe('setScopePriorityFn', () => {
+  it('sets only the priority through the priority route', async () => {
+    routes.push([
+      /^PATCH \/api\/admin\/config\/group\/[^/]+\/priority$/,
+      (call) => [
+        200,
+        { config: { ...configs[2], priority: JSON.parse(call.body ?? '{}').priority } },
+      ],
+    ]);
+    await expect(
+      setScopePriorityFn({
+        data: { principalType: PrincipalType.GROUP, principalId: ENG, priority: 15 },
+      }),
+    ).resolves.toEqual({ priority: 15 });
+    expect(calls).toEqual([
+      {
+        url: `/api/admin/config/group/${ENG}/priority`,
+        method: 'PATCH',
+        body: JSON.stringify({ priority: 15 }),
+      },
+    ]);
+  });
+
+  it("words the server's refusal", async () => {
+    routes.push([
+      /^PATCH /,
+      () => [400, { error: 'priority must be a non-negative number', code: 'INVALID_PRIORITY' }],
+    ]);
+    await expect(
+      setScopePriorityFn({
+        data: { principalType: PrincipalType.GROUP, principalId: ENG, priority: 15 },
+      }),
+    ).rejects.toThrow('The priority must be a number of 0 or more.');
   });
 });

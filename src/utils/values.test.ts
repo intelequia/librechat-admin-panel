@@ -6,9 +6,10 @@ import {
   valuesDataFixture,
   scopeConfigFixture,
   scopeLayersFixture,
+  FIXTURE_SCHEMA_PATHS,
 } from '@/test/layers';
-import { deriveFieldState, deriveFieldValue, resolveShadowedBy } from './values';
-import { mergeScopeLayer } from './layers';
+import { deriveFieldState, deriveFieldValue, revertTargetAt, resolveShadowedBy } from './values';
+import { mergeScopeLayer, createBaseLayers } from './layers';
 
 function data(overrides: Partial<t.ConfigValuesData> = {}): t.ConfigValuesData {
   return {
@@ -318,6 +319,66 @@ describe('resolveShadowedBy (endpoints.all precedence)', () => {
       'gpt-5.6-luna',
     );
   });
+
+  describe("on a server that resolves titles per field (titleResolution: 'field')", () => {
+    const withTitles = (all: t.ConfigRecord): t.ConfigRecord => ({
+      endpoints: { all, openAI: { titleModel: 'gpt-5-mini', titleMethod: 'structured' } },
+    });
+
+    it('shadows a title setting only where `all` sets it', () => {
+      const tree = withTitles({ activityLabel: true, titleMethod: 'completion' });
+      expect(resolveShadowedBy('endpoints.openAI.titleModel', tree, {}, 'field')).toBeUndefined();
+      expect(resolveShadowedBy('endpoints.openAI.titleMethod', tree, {}, 'field')).toEqual({
+        path: 'endpoints.all.titleMethod',
+        value: 'completion',
+        precedence: 'field',
+      });
+      expect(resolveShadowedBy('endpoints.openAI.titleMethod', tree)?.precedence).toBe('block');
+    });
+
+    it('treats the title endpoint and model as one choice, pointing to the half `all` sets', () => {
+      const tree = withTitles({ titleEndpoint: 'anthropic' });
+      expect(resolveShadowedBy('endpoints.openAI.titleModel', tree, {}, 'field')).toEqual({
+        path: 'endpoints.all.titleEndpoint',
+        value: undefined,
+        precedence: 'pair',
+      });
+      expect(
+        resolveShadowedBy(
+          'endpoints.custom.0.titleEndpoint',
+          withTitles({ titleModel: 'm' }),
+          {},
+          'field',
+        ),
+      ).toEqual({ path: 'endpoints.all.titleModel', value: undefined, precedence: 'pair' });
+      expect(
+        resolveShadowedBy(
+          'endpoints.openAI.titleModel',
+          withTitles({}),
+          {
+            'endpoints.all.titleEndpoint': 'anthropic',
+          },
+          'field',
+        )?.path,
+      ).toBe('endpoints.all.titleEndpoint');
+      expect(
+        resolveShadowedBy(
+          'endpoints.openAI.titleModel',
+          tree,
+          { 'endpoints.all.titleEndpoint': undefined },
+          'field',
+        ),
+      ).toBeUndefined();
+    });
+
+    it('is reported on the field state with the contract of the values', () => {
+      const data = valuesDataFixture(baseLayersFixture());
+      const state = (titleResolution?: t.ConfigRules['titleResolution']) =>
+        deriveFieldState('endpoints.openAI.titleModel', { ...data, titleResolution }).shadowedBy;
+      expect(state()?.precedence).toBe('block');
+      expect(state('field')).toBeUndefined();
+    });
+  });
 });
 
 describe('deriveFieldValue', () => {
@@ -488,6 +549,83 @@ describe('deriveFieldState for custom endpoints (merged by name)', () => {
       value: 'https://override.example.com',
       source: 'inherited',
       inherited: { value: 'https://override.example.com', source: 'admin' },
+    });
+  });
+});
+
+describe('deriveFieldState inside an entry the target removes values of by key', () => {
+  const removal = 'endpoints.custom["GPT"].headers.X-Team';
+  const yaml: t.ConfigRecord = {
+    endpoints: {
+      custom: [
+        {
+          name: 'GPT',
+          baseURL: 'https://gpt.example.com',
+          headers: { 'X-Team': 'yaml', 'X-Keep': 'kept' },
+        },
+      ],
+    },
+  };
+  const own: t.ConfigRecord = {
+    endpoints: { custom: [{ name: 'GPT', headers: { 'X-Own': 'own' } }] },
+  };
+  const merged = { name: 'GPT', baseURL: 'https://gpt.example.com' };
+
+  describe('in a profile', () => {
+    const base = baseConfigFixture({ yamlConfig: yaml, config: yaml, dbOverrides: {} });
+    const scope = scopeConfigFixture({
+      overrides: own,
+      changedPaths: ['endpoints.custom'],
+      tombstones: [removal],
+    });
+
+    it('reverts a record to Base without the keys the profile removes (keyedTombstones)', () => {
+      const layers = scopeLayersFixture(scope, base, true);
+      const state = deriveFieldState('endpoints.custom.0.headers', valuesDataFixture(layers));
+      expect(state.value).toEqual({ 'X-Keep': 'kept', 'X-Own': 'own' });
+      expect(state.revertTarget).toEqual({ value: { 'X-Keep': 'kept' }, source: 'inherited' });
+      expect(revertTargetAt('endpoints.custom.0.headers', layers)?.value).toEqual({
+        'X-Keep': 'kept',
+      });
+    });
+
+    it('keeps the removed key in the entry itself, which Remove overrides sets back whole', () => {
+      const layers = scopeLayersFixture(scope, base, true);
+      expect(revertTargetAt('endpoints.custom.0', layers)?.value).toEqual({
+        ...merged,
+        headers: { 'X-Team': 'yaml', 'X-Keep': 'kept' },
+      });
+    });
+
+    it('reverts to Base as it is before the server applies keyed tombstones', () => {
+      const layers = scopeLayersFixture(scope, base, false);
+      const state = deriveFieldState('endpoints.custom.0.headers', valuesDataFixture(layers));
+      expect(state.revertTarget?.value).toEqual({ 'X-Team': 'yaml', 'X-Keep': 'kept' });
+    });
+  });
+
+  describe('in Base', () => {
+    const data = baseConfigFixture({
+      yamlConfig: yaml,
+      config: {
+        endpoints: {
+          custom: [{ ...merged, headers: { 'X-Keep': 'kept', 'X-Own': 'own' } }],
+        },
+      },
+      dbOverrides: own,
+      dbTombstones: [removal],
+    });
+
+    it('reverts a record to librechat.yaml without the keys Base removes (keyedTombstones)', () => {
+      const layers = createBaseLayers(data, FIXTURE_SCHEMA_PATHS, undefined, true);
+      const state = deriveFieldState('endpoints.custom.0.headers', valuesDataFixture(layers));
+      expect(state.revertTarget).toEqual({ value: { 'X-Keep': 'kept' }, source: 'yaml' });
+    });
+
+    it('reverts to librechat.yaml as it is without the flag', () => {
+      const layers = createBaseLayers(data, FIXTURE_SCHEMA_PATHS);
+      const state = deriveFieldState('endpoints.custom.0.headers', valuesDataFixture(layers));
+      expect(state.revertTarget?.value).toEqual({ 'X-Team': 'yaml', 'X-Keep': 'kept' });
     });
   });
 });

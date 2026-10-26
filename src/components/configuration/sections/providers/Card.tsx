@@ -2,14 +2,24 @@ import { useContext, useMemo } from 'react';
 import type { ReactNode } from 'react';
 import type * as t from '@/types';
 import {
+  editsVertex,
+  editsAzureGroups,
+  GLOBAL_PROVIDER_KEY,
+  DEFAULT_RECURSION_LIMIT,
+} from '@/constants';
+import {
   formatSummary,
   summarizeFields,
   createSummaryReader,
   resolveProviderGroups,
 } from './layout';
-import { useLocalize, useGlobalTitleBlock, usePersistentExpanded } from '@/hooks';
+import {
+  useLocalize,
+  useConfigFeatures,
+  useGlobalTitleBlock,
+  usePersistentExpanded,
+} from '@/hooks';
 import { getValueAtPath, isConfigRecord, getUnknownConfigEntries } from '@/utils';
-import { GLOBAL_PROVIDER_KEY, DEFAULT_RECURSION_LIMIT } from '@/constants';
 import { ProviderStatusBadge, ProviderStatusRow } from './ProviderStatus';
 import { isPathSet, countConfigured, hasPathOverlap } from '../../counts';
 import { ConfigValuesContext } from '@/contexts/ConfigValuesContext';
@@ -28,6 +38,24 @@ const NO_PATHS: ReadonlySet<string> = new Set();
 const AZURE_TABLE_KEYS: ReadonlySet<string> = new Set(['groups']);
 const VERTEX_KEYS: ReadonlySet<string> = new Set(['vertex']);
 
+/**
+ * What the Azure groups notice says: they are edited here (LibreChat derives
+ * them again), stored but not applied until the operator turns that on, or
+ * applied but not editable, or only read from librechat.yaml.
+ */
+function azureBannerKey(features: t.ConfigFeatures): string {
+  if (editsAzureGroups(features)) return 'com_config_providers_azure_editable';
+  if (features.azureGroupMergeKey) return 'com_config_providers_azure_readonly_inert';
+  if (features.azureGroupSecrets) return 'com_config_providers_azure_readonly_applied';
+  return 'com_config_providers_azure_readonly';
+}
+
+/** What LibreChat does with a stored groups override the panel can't edit (`StaleOverrideState`). */
+function staleOverrideState(features: t.ConfigFeatures): t.StaleOverrideState {
+  if (features.azureGroupMergeKey) return 'inert';
+  return features.azureGroupSecrets ? 'applied' : 'stale';
+}
+
 /** A number setting's value, or undefined when unset or not a number. */
 function numberAt(value: t.ConfigValue): number | undefined {
   return typeof value === 'number' ? value : undefined;
@@ -43,6 +71,7 @@ function numberAt(value: t.ConfigValue): number | undefined {
  */
 export function ProviderCard({ field, parentPath, parentValue, ...rest }: t.ProviderCardProps) {
   const localize = useLocalize();
+  const features = useConfigFeatures();
   const rowFilter = useContext(RowFilterContext);
   const values = useContext(ConfigValuesContext);
   const hasGlobal = useGlobalTitleBlock();
@@ -79,6 +108,7 @@ export function ProviderCard({ field, parentPath, parentValue, ...rest }: t.Prov
             configuredPaths,
             editedValues,
             root: values?.configValues ?? null,
+            titleResolution: values?.titleResolution,
           }),
           localize,
         ),
@@ -87,7 +117,11 @@ export function ProviderCard({ field, parentPath, parentValue, ...rest }: t.Prov
 
   const description: ReactNode = isGlobal ? (
     <>
-      {localize('com_config_providers_global_desc')}
+      {localize(
+        values?.titleResolution === 'field'
+          ? 'com_config_providers_global_desc_field'
+          : 'com_config_providers_global_desc',
+      )}
       {summary && (
         <span className="provider-card-summary">
           {localize('com_config_providers_summary_set', { summary })}
@@ -109,11 +143,12 @@ export function ProviderCard({ field, parentPath, parentValue, ...rest }: t.Prov
     const groupSet = group.fields.some((child) =>
       isPathSet(`${path}.${child.key}`, configuredPaths, editedValues),
     );
-    if (key === 'titles' && isGlobal && !groupSet) {
+    if (key === 'titles' && isGlobal && !groupSet && values?.titleResolution !== 'field') {
       return { summaryOverride: localize('com_config_providers_summary_global_titles') };
     }
     if (key === 'groups' && field.key === 'azureOpenAI') {
       const groupsPath = `${path}.groups`;
+      const editsGroups = editsAzureGroups(features);
       const groupsValue = getValue(groupsPath, getValueAtPath(providerValue, 'groups'));
       const groupCount = Array.isArray(groupsValue) ? groupsValue.length : 0;
       return {
@@ -127,20 +162,21 @@ export function ProviderCard({ field, parentPath, parentValue, ...rest }: t.Prov
           ) : undefined,
         before: (
           <div className="flex flex-col gap-3">
-            <InfoBanner
-              text={localize('com_config_providers_azure_readonly')}
-              dismissible={false}
-            />
-            {hasPathOverlap(groupsPath, dbOverridePaths ?? NO_PATHS) && (
+            <InfoBanner text={localize(azureBannerKey(features))} dismissible={false} />
+            {!editsGroups && hasPathOverlap(groupsPath, dbOverridePaths ?? NO_PATHS) && (
               <StaleOverride
                 pendingRemoval={rest.pendingResets?.has(groupsPath) ?? false}
                 onRemove={disabled || !onResetField ? undefined : () => onResetField(groupsPath)}
+                state={staleOverrideState(features)}
               />
             )}
             <AzureGroupsTable
               path={groupsPath}
               value={groupsValue}
               field={children.find((child) => child.key === 'groups')}
+              onChange={editsGroups ? rest.onChange : undefined}
+              disabled={disabled}
+              editSessionId={rest.editSessionId}
             />
           </div>
         ),
@@ -148,6 +184,25 @@ export function ProviderCard({ field, parentPath, parentValue, ...rest }: t.Prov
     }
     if (key === 'models' && field.key === 'anthropic') {
       const vertexPath = `${path}.vertex`;
+      if (editsVertex(features)) {
+        /** LibreChat turns Vertex AI on for a profile only where librechat.yaml configures it. */
+        const inYaml = isConfigRecord(getValueAtPath(values?.layers?.yamlEffective, vertexPath));
+        if (!inYaml) {
+          return {
+            hiddenKeys: VERTEX_KEYS,
+            after: (
+              <p className="settings-help m-0 py-2">
+                {localize('com_config_providers_vertex_none_yaml')}
+              </p>
+            ),
+          };
+        }
+        return {
+          after: (
+            <p className="settings-help m-0 py-2">{localize('com_config_providers_vertex_note')}</p>
+          ),
+        };
+      }
       const vertexSet = isConfigRecord(
         getValue(vertexPath, getValueAtPath(providerValue, 'vertex')),
       );

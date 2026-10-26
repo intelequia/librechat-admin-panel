@@ -1,8 +1,9 @@
 import type * as t from '@/types';
 import {
   getEntryKey,
-  getKeyedCollection,
   hasIssueMessage,
+  getKeyedCollection,
+  paramlessIssueCode,
   findKeyedCollectionEntry,
 } from '@/utils';
 import { labelForPath } from './meta';
@@ -35,24 +36,39 @@ export function issueDisplayPath(issue: t.ConfigIssue, collections: t.PendingCol
 
 const BOUND_FORMAT = new Intl.NumberFormat(undefined, { maximumFractionDigits: 6 });
 
-/** Issue parameters for display: numbers with digit grouping ("60,000"). */
+/**
+ * Issue parameters for display: numbers with digit grouping ("60,000"), and
+ * the settings an issue names (`fieldPaths`, `|`-separated) as their labels
+ * (`fields`: "Server URL, Transport").
+ */
 function displayParams(
   params: t.ConfigIssue['params'],
+  localize: t.LocalizeFn,
 ): Record<string, string | number> | undefined {
   if (!params) return params;
-  return Object.fromEntries(
+  const shown: Record<string, string | number> = Object.fromEntries(
     Object.entries(params).map(([name, value]) => [
       name,
       typeof value === 'number' ? BOUND_FORMAT.format(value) : value,
     ]),
   );
+  if (typeof params.fieldPaths === 'string' && params.fieldPaths !== '') {
+    const labels = params.fieldPaths.split('|').map((path) => labelForPath(path, localize));
+    shown.fields = [...new Set(labels)].join(', ');
+  }
+  return shown;
 }
 
-/** Localized message of an issue: `com_config_issue_<code>` when there is one, else the server's text. */
+/**
+ * Localized message of an issue: `com_config_issue_<code>` when there is one,
+ * else the server's text. An issue without parameters (the admin API reports
+ * codes only) is worded without them (`paramlessIssueCode`).
+ */
 function issuePredicate(issue: t.ConfigIssue, localize: t.LocalizeFn): string {
   if (!issue.code) return issue.message;
-  const key = `com_config_issue_${issue.code.toLowerCase()}`;
-  const localized = localize(key, displayParams(issue.params));
+  const code = issue.params ? issue.code : paramlessIssueCode(issue.code);
+  const key = `com_config_issue_${code.toLowerCase()}`;
+  const localized = localize(key, displayParams(issue.params, localize));
   return localized === key ? issue.message : localized;
 }
 

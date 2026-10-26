@@ -1,15 +1,20 @@
-import { useQuery } from '@tanstack/react-query';
 import { useNavigate } from '@tanstack/react-router';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useState, useMemo, useEffect, useCallback, useContext } from 'react';
 import type * as t from '@/types';
 import {
   getScopeIndex,
+  entryKeyMoves,
   applyScopeGates,
   parseScopeParam,
   findScopeByParam,
   formatScopeParam,
+  findEntryOverrides,
+  findUnboundOverrides,
 } from '@/utils';
+import { useConfigWriteRules, useConfigFeatures } from './contract';
 import { ScopeActionsContext } from '@/contexts/ScopeContext';
+import { RESOLVED_READ_QUERY_KEYS } from '@/constants';
 import { availableScopesOptions } from '@/server';
 
 const EMPTY_SCOPES: t.ConfigScope[] = [];
@@ -100,6 +105,24 @@ export function useScopeSelection({
 }
 
 /**
+ * Refreshes what a change to who gets which configuration makes stale: a
+ * profile created, deleted, switched on or off or re-prioritised, or a role
+ * or group membership edited. The profiles list is refetched, and the
+ * returned promise waits for it; the server-resolved reads (previews, scope
+ * catalogs, env status) are marked stale and refetch in the background, so a
+ * Preview opened next shows what the server resolves now.
+ */
+export function useRefreshScopes(): () => Promise<void> {
+  const queryClient = useQueryClient();
+  return useCallback(() => {
+    for (const queryKey of RESOLVED_READ_QUERY_KEYS) {
+      void queryClient.invalidateQueries({ queryKey });
+    }
+    return queryClient.invalidateQueries({ queryKey: availableScopesOptions.queryKey });
+  }, [queryClient]);
+}
+
+/**
  * Every profile, indexed by the paths it overrides or hides (WS8). Built from
  * the shared scopes list, so it costs no request of its own.
  */
@@ -125,6 +148,43 @@ export function useFieldProfiles(path?: string): t.ConfigScope[] | undefined {
 }
 
 /**
+ * The notes a card in Base shows on an entry of `collection` for the
+ * profiles that override it by name (`findEntryOverrides`; worded by
+ * `describeOverrideNotes`): what a rename or removal leaves under the old
+ * name, the own keys a moved destination stops (`findUnboundOverrides`,
+ * with `secretRebinding`), and what a rename or new entry onto a name they
+ * override takes. None in a profile or outside the configuration page.
+ */
+export function useEntryOverrideNotes(collection: string): t.EntryOverrideNotes {
+  const { secretRebinding, keyedTombstones } = useConfigFeatures();
+  const context = useContext(ScopeActionsContext);
+  const scopes = context && !context.editingScope ? context.index.scopes : undefined;
+  return useMemo((): t.EntryOverrideNotes => {
+    const describe = (
+      change: t.EntryOverrideChange,
+      affected: (found: t.EntryOverride[]) => t.EntryOverride[] = (found) => found,
+    ): t.EntryOverrideNote[] => {
+      const found = scopes
+        ? findEntryOverrides(scopes, collection, change.name, keyedTombstones)
+        : [];
+      const overrides = found.length > 0 ? affected(found) : found;
+      return overrides.length > 0 ? [{ change, overrides, collection }] : [];
+    };
+    return {
+      left: (name, rename) =>
+        describe(rename ? { kind: 'renamed', name, ...rename } : { kind: 'removed', name }),
+      moved: (name, entry) =>
+        secretRebinding
+          ? describe({ kind: 'moved', name }, (found) =>
+              findUnboundOverrides(entryKeyMoves(collection, entry), found),
+            )
+          : [],
+      took: (name) => describe({ kind: 'took', name, sendsKeys: !secretRebinding }),
+    };
+  }, [scopes, collection, secretRebinding, keyedTombstones]);
+}
+
+/**
  * The tab's sections with, in a profile, the ones that apply to everyone
  * marked `scopeGate` so they render as an "edit in Base" card (WS8: PR-7).
  */
@@ -132,5 +192,9 @@ export function useScopeGatedSections(
   sections: t.ConfigSectionConfig[],
   isEditingScope: boolean,
 ): t.ConfigSectionConfig[] {
-  return useMemo(() => applyScopeGates(sections, isEditingScope), [sections, isEditingScope]);
+  const writeRules = useConfigWriteRules();
+  return useMemo(
+    () => applyScopeGates(sections, isEditingScope, writeRules),
+    [sections, isEditingScope, writeRules],
+  );
 }

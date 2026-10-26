@@ -1,8 +1,8 @@
 import type { ReactNode } from 'react';
 import type { ConfigRecord, SchemaField, OptionSource, FieldMetaGroup } from './config';
+import type { ProvenanceSource, SettingRow } from './values';
 import type { FieldRendererProps } from './config-ui';
 import type { FieldControlProps } from './controls';
-import type { ProvenanceSource, SettingRow } from './values';
 
 /** What an allowlist entry may look like, and the copy its control shows (WS13 FX-16). */
 export interface DomainListPolicy {
@@ -49,8 +49,11 @@ export interface WebSearchCredential {
   required: boolean;
   /** A key: typed into a masked input. */
   secret: boolean;
-  /** LibreChat stores it encrypted and returns a masked preview (`<key>Preview`). */
-  encrypted: boolean;
+  /**
+   * LibreChat stores it encrypted and returns a masked preview (`<key>Preview`)
+   * only once it reports `webSearchStoredKeys` (Keenable); otherwise always, when `secret`.
+   */
+  encryptedSince?: 'webSearchStoredKeys';
   /** The environment variable LibreChat reads when the key is not set (`SERPER_API_KEY`). */
   env: string;
 }
@@ -204,7 +207,7 @@ export type StatusTone = 'muted' | 'ok' | 'warn';
 /** The status line of a web search credential. */
 export interface CredentialStatusLine {
   tone: StatusTone;
-  icon: 'key' | 'lock' | 'warning';
+  icon: 'key' | 'lock' | 'warning' | 'user';
   text: string;
 }
 

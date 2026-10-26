@@ -8,7 +8,7 @@ import type {
   SchemaField,
   SelectOption,
 } from './config';
-import type { ClearHandler, CollectionRenderFields } from './fields';
+import type { ClearHandler, RecordKeyRemoval, CollectionRenderFields } from './fields';
 import type { ProvenanceSource } from './values';
 
 /** One branch of a variant field as the variant control reads it (from WS2's `SchemaField.variants`). */
@@ -59,12 +59,16 @@ export interface FieldControlProps {
   required?: boolean;
   /** Masked display of a stored secret (`<key>Preview` companion). */
   secretPreview?: string | null;
+  /** See `SecretFieldProps.maskLabel`. */
+  secretMaskLabel?: string;
   /** The secret has a queued replacement (see `SecretFieldProps.hasPendingEdit`). */
   hasPendingEdit?: boolean;
   /** Abandons a secret replacement without recording an edit. */
   onCancelSecret?: () => void;
   /** Record keys the layer beneath sets: their values can change, but they cannot be removed (D3). */
   lockedKeys?: ReadonlySet<string>;
+  /** Removing those keys by key, where the server takes it (`keyedTombstones`). */
+  keyRemoval?: RecordKeyRemoval;
   editSessionId?: number;
   'aria-describedby'?: string;
 }

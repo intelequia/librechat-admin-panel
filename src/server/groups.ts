@@ -11,6 +11,7 @@ import { createServerFn } from '@tanstack/react-start';
 import type { AdminGroup, AdminMember } from '@librechat/data-schemas';
 import type * as t from '@/types';
 import { apiFetch, extractApiError } from './utils/api';
+import { fetchAllPages } from '@/utils';
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -42,7 +43,7 @@ function toAdminGroup(raw: RawGroup): AdminGroup {
 export const GROUPS_PAGE_SIZE = 50;
 export const MEMBERS_PAGE_SIZE = 50;
 
-/** Backend max per request is 200. Consumers needing all groups use this cap. */
+/** Backend max per request is 200; consumers needing all groups read pages of this size. */
 const ALL_GROUPS_LIMIT = 200;
 
 const GROUP_SOURCE_LOCAL = 'local' as const;
@@ -50,7 +51,7 @@ const GROUP_SOURCE_LOCAL = 'local' as const;
 // ── Server functions ─────────────────────────────────────────────────
 
 export const getGroupsFn = createServerFn({ method: 'GET' })
-  .inputValidator(
+  .validator(
     z.object({
       search: z.string().optional(),
       limit: z.number().optional(),
@@ -93,7 +94,13 @@ export const groupsQueryOptions = (page = 1, search = '') =>
 
 export const allGroupsQueryOptions = queryOptions<AdminGroup[]>({
   queryKey: ['groups', 'all'],
-  queryFn: () => getGroupsFn({ data: { limit: ALL_GROUPS_LIMIT } }).then((r) => r.groups),
+  queryFn: () =>
+    fetchAllPages((offset) =>
+      getGroupsFn({ data: { limit: ALL_GROUPS_LIMIT, offset } }).then(({ groups, total }) => ({
+        items: groups,
+        total,
+      })),
+    ),
   staleTime: 30_000,
 });
 
@@ -108,7 +115,7 @@ export const groupAssignmentsQueryOptions = queryOptions({
 });
 
 export const createGroupFn = createServerFn({ method: 'POST' })
-  .inputValidator(
+  .validator(
     z.object({
       name: z.string().min(1),
       description: z.string().default(''),
@@ -131,7 +138,7 @@ export const createGroupFn = createServerFn({ method: 'POST' })
   });
 
 export const updateGroupFn = createServerFn({ method: 'POST' })
-  .inputValidator(
+  .validator(
     z.object({
       id: z.string(),
       name: z.string().min(1).optional(),
@@ -152,7 +159,7 @@ export const updateGroupFn = createServerFn({ method: 'POST' })
   });
 
 export const deleteGroupFn = createServerFn({ method: 'POST' })
-  .inputValidator(z.object({ id: z.string() }))
+  .validator(z.object({ id: z.string() }))
   .handler(async ({ data }: { data: { id: string } }) => {
     const response = await apiFetch(`/api/admin/groups/${encodeURIComponent(data.id)}`, {
       method: 'DELETE',
@@ -164,7 +171,7 @@ export const deleteGroupFn = createServerFn({ method: 'POST' })
   });
 
 export const getGroupMembersFn = createServerFn({ method: 'GET' })
-  .inputValidator(
+  .validator(
     z.object({
       groupId: z.string(),
       limit: z.number().optional(),
@@ -206,7 +213,7 @@ export const groupMembersQueryOptions = (groupId: string, page = 1) =>
   });
 
 export const addGroupMemberFn = createServerFn({ method: 'POST' })
-  .inputValidator(z.object({ groupId: z.string(), userId: z.string() }))
+  .validator(z.object({ groupId: z.string(), userId: z.string() }))
   .handler(async ({ data }: { data: { groupId: string; userId: string } }) => {
     const response = await apiFetch(
       `/api/admin/groups/${encodeURIComponent(data.groupId)}/members`,
@@ -222,7 +229,7 @@ export const addGroupMemberFn = createServerFn({ method: 'POST' })
   });
 
 export const removeGroupMemberFn = createServerFn({ method: 'POST' })
-  .inputValidator(z.object({ groupId: z.string(), userId: z.string() }))
+  .validator(z.object({ groupId: z.string(), userId: z.string() }))
   .handler(async ({ data }: { data: { groupId: string; userId: string } }) => {
     const response = await apiFetch(
       `/api/admin/groups/${encodeURIComponent(data.groupId)}/members/${encodeURIComponent(data.userId)}`,

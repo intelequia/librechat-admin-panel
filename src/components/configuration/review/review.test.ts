@@ -1,10 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { configSchema } from 'librechat-data-provider';
 import type * as t from '@/types';
-import { summarizeChanges, applySaves, isSecretPath } from './diff';
 import { buildReviewModel, describePath } from './group';
 import translation from '@/locales/en/translation.json';
 import { flattenObject, getValueAtPath } from '@/utils';
+import { summarizeChanges, applySaves } from './diff';
 import { extractSchemaTree } from '@/server/config';
 import { parseIssueMessages } from './issues';
 import { formatReviewValue } from './format';
@@ -411,6 +411,44 @@ describe('summarizeChanges: MCP servers and secrets', () => {
     });
   });
 
+  it('lists no row for a stored key a renamed server leaves out, and a replaced one as replaced', () => {
+    const vault = {
+      url: 'https://vault.example/mcp',
+      apiKey: { source: 'admin', keyPreview: '...4321' },
+    };
+    const input = (key?: string) =>
+      makeInput({
+        baseline: { mcpServers: { vault } },
+        ownAt: (path) => (path === 'mcpServers.vault' ? vault : undefined),
+        saves: [
+          { fieldPath: 'mcpServers.vault-kb.url', value: vault.url },
+          { fieldPath: 'mcpServers.vault-kb.apiKey.source', value: 'admin' },
+          ...(key ? [{ fieldPath: 'mcpServers.vault-kb.apiKey.key', value: key }] : []),
+        ],
+        resets: ['mcpServers.vault'],
+        renames: { 'mcpServers.vault-kb': 'mcpServers.vault' },
+      });
+    expect(summarizeChanges(input())).toEqual([
+      expect.objectContaining({ kind: 'renamed', path: 'mcpServers.vault-kb' }),
+    ]);
+    const replaced = summarizeChanges(input('sk-new'));
+    expect(replaced).toEqual([
+      expect.objectContaining({ kind: 'renamed', path: 'mcpServers.vault-kb' }),
+      expect.objectContaining({
+        kind: 'changed',
+        path: 'mcpServers.vault-kb.apiKey.key',
+        before: '...4321',
+        after: 'sk-new',
+        secret: true,
+      }),
+    ]);
+    const edited = { 'mcpServers.vault-kb.apiKey.key': 'sk-new' };
+    expect(planRevert(replaced[1], edited, { mcpServers: { vault } })).toEqual({
+      op: 'discard',
+      paths: ['mcpServers.vault-kb.apiKey.key'],
+    });
+  });
+
   it('undoes only the rename of a server, keeping its field changes under the old name', () => {
     const dbsrv = {
       type: 'streamable-http',
@@ -504,10 +542,6 @@ describe('summarizeChanges: MCP servers and secrets', () => {
   });
 
   it('marks secret leaves, including an apiKey object key', () => {
-    expect(isSecretPath('endpoints.custom.0.apiKey')).toBe(true);
-    expect(isSecretPath('mcpServers.x.apiKey.key')).toBe(true);
-    expect(isSecretPath('mcpServers.x.oauth.client_secret')).toBe(true);
-    expect(isSecretPath('mcpServers.x.apiKey.source')).toBe(false);
     const [item] = summarizeChanges(
       makeInput({
         baseline,
@@ -635,6 +669,33 @@ describe('buildReviewModel', () => {
     ).toMatch(/› us\.anthropic\.claude-sonnet-4-6$/);
   });
 
+  it('keeps a dotted model name of an Azure group whole, beside one it starts with', () => {
+    const models = { 'gpt-4': { deploymentName: 'gpt4' }, 'gpt-4.1': { deploymentName: 'gpt41' } };
+    const saves: t.SaveEntry[] = [
+      {
+        fieldPath: 'endpoints.azureOpenAI.groups',
+        value: [{ group: 'eastus', instanceName: 'east', version: 'v1', models }],
+      },
+    ];
+    expect(
+      describePath('endpoints.azureOpenAI.groups.0.models.gpt-4.1.deploymentName', ctx(saves)),
+    ).toMatch(/› eastus › Models › gpt-4\.1 › Deployment name$/);
+  });
+
+  it("labels a change of an Azure group's whole model by the model's name alone", () => {
+    const before = { group: 'eastus', models: { 'gpt-5.2-chat': { deploymentName: 'dep' } } };
+    const groups = 'endpoints.azureOpenAI.groups';
+    const saves: t.SaveEntry[] = [
+      { fieldPath: groups, value: [{ group: 'eastus', models: { 'gpt-5.2-chat': true } }] },
+    ];
+    const items = summarizeChanges(
+      makeInput({ baseline: { endpoints: { azureOpenAI: { groups: [before] } } }, saves }),
+    );
+    const model = buildReviewModel(items, ctx(saves));
+    const [group] = model.tabs.flatMap((tab) => tab.sections.flatMap((s) => s.entries));
+    expect(group.rows.map((row) => row.label)).toEqual(['gpt-5.2-chat']);
+  });
+
   it("labels a merged-back entry key on the entry's own tab, not as raw segments", () => {
     expect(describePath('endpoints.custom.1.customParams.paramDefinitions', ctx([]))).toBe(
       'Custom endpoints › Zai 2 › Custom parameters › Parameter definitions',
@@ -760,6 +821,145 @@ describe('planRevert', () => {
       op: 'set',
       path: 'endpoints.custom.1',
       value: { ...zai, apiKey: 'k9' },
+    });
+  });
+
+  describe('dotted record keys', () => {
+    const PROFILES = 'endpoints.bedrock.inferenceProfiles';
+    const US = 'us.anthropic.claude-sonnet-4-6';
+    const GLOBAL = 'global.anthropic.claude-opus-5-5';
+    const pairs = (record: Record<string, string>) =>
+      Object.entries(record).map(([key, value]) => ({ key, value }));
+    const withProfiles = (profiles?: t.ConfigRecord): t.ConfigRecord =>
+      profiles ? { endpoints: { bedrock: { inferenceProfiles: profiles } } } : {};
+
+    function rowsOf(profiles: t.ConfigRecord | undefined, pending: Record<string, string>) {
+      const tree = withProfiles(profiles);
+      const saves = [{ fieldPath: PROFILES, value: pending }];
+      const items = summarizeChanges(makeInput({ baseline: tree, saves, isOwned: () => true }));
+      return { tree, items, edited: { [PROFILES]: pairs(pending) } };
+    }
+
+    it('keeps the key whole in the row, so Revert drops only that added key', () => {
+      const pending = { plainA: 'arn:a', [US]: 'arn:us', [GLOBAL]: 'arn:global' };
+      const { tree, items, edited } = rowsOf({ plainA: 'arn:a' }, pending);
+      expect(items.map((item) => item.path)).toEqual([
+        `${PROFILES}.${US}`,
+        `${PROFILES}.${GLOBAL}`,
+      ]);
+      const us = items[0];
+      expect(us.segments).toEqual(['endpoints', 'bedrock', 'inferenceProfiles', US]);
+      expect(planRevert(us, edited, tree)).toEqual({
+        op: 'set',
+        path: PROFILES,
+        value: { plainA: 'arn:a', [GLOBAL]: 'arn:global' },
+      });
+    });
+
+    it('puts a removed stored key back and keeps the other change', () => {
+      const pending = { [US]: 'arn:us2' };
+      const { tree, items, edited } = rowsOf({ [US]: 'arn:us', [GLOBAL]: 'arn:global' }, pending);
+      const removed = items.find((item) => item.kind === 'removed')!;
+      expect(removed.segments).toEqual(['endpoints', 'bedrock', 'inferenceProfiles', GLOBAL]);
+      expect(planRevert(removed, edited, tree)).toEqual({
+        op: 'set',
+        path: PROFILES,
+        value: { [US]: 'arn:us2', [GLOBAL]: 'arn:global' },
+      });
+      const changed = items.find((item) => item.kind === 'changed')!;
+      expect(planRevert(changed, edited, tree)).toEqual({
+        op: 'set',
+        path: PROFILES,
+        value: { [US]: 'arn:us' },
+      });
+    });
+
+    it('reverts a key of a record set where nothing was stored', () => {
+      const pending = { [US]: 'arn:us', [GLOBAL]: 'arn:global' };
+      const { tree, items, edited } = rowsOf(undefined, pending);
+      const global = items.find((item) => item.path === `${PROFILES}.${GLOBAL}`)!;
+      expect(global).toMatchObject({ kind: 'added', segments: [...PROFILES.split('.'), GLOBAL] });
+      expect(planRevert(global, edited, tree)).toEqual({
+        op: 'set',
+        path: PROFILES,
+        value: { [US]: 'arn:us' },
+      });
+    });
+
+    it('reverts a dotted header of a list entry and keeps its other change', () => {
+      const team = { ...moonshot, headers: { 'x-team': 'eng' } };
+      const tree = { ...baseline, endpoints: { custom: [team, zai, vercel] } };
+      const edited = {
+        ...team,
+        modelDisplayLabel: 'Kimi',
+        headers: { 'x-team': 'eng', 'x-portkey.config': 'cfg' },
+      };
+      const pending = [edited, zai, vercel];
+      const items = summarizeChanges(makeInput({ baseline: tree, saves: saveList(pending) }));
+      const header = items.find(
+        (item) => item.path === 'endpoints.custom.0.headers.x-portkey.config',
+      )!;
+      expect(header.segments).toEqual(['endpoints', 'custom', '0', 'headers', 'x-portkey.config']);
+      expect(planRevert(header, { 'endpoints.custom': pending }, tree)).toEqual({
+        op: 'set',
+        path: 'endpoints.custom',
+        value: [{ ...team, modelDisplayLabel: 'Kimi' }, zai, vercel],
+      });
+    });
+
+    it('shows a dotted key whose text ends in a secret name as the value it is', () => {
+      const header = 'tenant.apiKey';
+      const team = { ...moonshot, headers: { [header]: 'acme' } };
+      const tree = { ...baseline, endpoints: { custom: [team, zai, vercel] } };
+      const changed = { ...team, headers: { [header]: 'globex' } };
+      const added = { ...zai, headers: { [header]: 'initech' } };
+      const items = summarizeChanges(
+        makeInput({ baseline: tree, saves: saveList([changed, added, vercel]) }),
+      );
+      expect(items).toHaveLength(2);
+      expect(items[0]).toMatchObject({ kind: 'changed', before: 'acme', after: 'globex' });
+      expect(items[1]).toMatchObject({ kind: 'added', after: 'initech' });
+      for (const item of items) {
+        expect(item.segments?.at(-1)).toBe(header);
+        expect(item.secret).toBeUndefined();
+      }
+      const profiles = summarizeChanges(
+        makeInput({
+          baseline: withProfiles({ 'us.secretKey': 'arn:a' }),
+          saves: [{ fieldPath: PROFILES, value: { 'us.secretKey': 'arn:b' } }],
+          isOwned: () => true,
+        }),
+      );
+      expect(profiles).toEqual([
+        expect.objectContaining({ kind: 'changed', before: 'arn:a', after: 'arn:b' }),
+      ]);
+      expect(profiles[0].secret).toBeUndefined();
+    });
+
+    it('still hides a secret field under a dotted key', () => {
+      const before = { 'team.one': { apiKey: 'sk-old' } };
+      const after = { 'team.one': { apiKey: 'sk-new' } };
+      const [item] = summarizeChanges(
+        makeInput({ baseline: { vaults: before }, saves: [{ fieldPath: 'vaults', value: after }] }),
+      );
+      expect(item).toMatchObject({
+        path: 'vaults.team.one.apiKey',
+        segments: ['vaults', 'team.one', 'apiKey'],
+        secret: true,
+      });
+    });
+
+    it('restores a dotted entry name of a record collection saved as a whole', () => {
+      const docs = { type: 'http', url: 'https://docs.example/mcp' };
+      const tree = { mcpServers: { ...baseline.mcpServers, 'my.server': docs } };
+      const pending = { ...baseline.mcpServers };
+      const saves = [{ fieldPath: 'mcpServers', value: pending }];
+      const [removed] = summarizeChanges(makeInput({ baseline: tree, saves }));
+      expect(removed).toMatchObject({ kind: 'removed', segments: ['mcpServers', 'my.server'] });
+      expect(planRevert(removed, { mcpServers: pending }, tree)).toEqual({
+        op: 'discard',
+        paths: ['mcpServers'],
+      });
     });
   });
 });

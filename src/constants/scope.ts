@@ -1,6 +1,7 @@
 import { PrincipalType } from 'librechat-data-provider';
 import type * as t from '@/types';
-import { DEDICATED_CONFIG_SECTIONS, READ_ONLY_CONFIG_SECTIONS, getConfigSection } from './config';
+import { BUNDLED_WRITE_RULES, DEDICATED_CONFIG_SECTIONS, getConfigSection } from './config';
+import { BASE_CONFIG_PRINCIPAL_ID } from './capabilities';
 
 export const SCOPE_TYPE_CONFIG: Record<t.ScopePrincipalType | 'BASE', t.ScopeTypeConfigEntry> = {
   BASE: {
@@ -44,27 +45,40 @@ export const DEFAULT_SCOPE_PRIORITY: Readonly<Record<t.ScopePrincipalType, numbe
   [PrincipalType.USER]: 100,
 };
 
+/** The highest priority the panel sets (the admin API takes any number of 0 or more). */
+export const MAX_SCOPE_PRIORITY = 1_000_000;
+
 /** Sections LibreChat reads before sign-in, when no role, group or user profile can apply. */
-const PRE_AUTH_SECTIONS = ['registration'];
+const PRE_AUTH_SECTIONS: ReadonlySet<string> = new Set(['registration']);
 
 /**
- * Top-level sections that cannot be set per profile, with the reason (WS8).
- * In a profile they render as an "Applies to everyone — edit in Base" card and
- * their paths are never sent.
+ * Why `path` (or its section) cannot be set per profile, if it can't (WS8):
+ * a section read before sign-in, a tenant-wide one, or one read-only
+ * everywhere (by the server's write `rules`). In a profile they render as an
+ * "Applies to everyone — edit in Base" card and their paths are never sent.
  */
-export const SCOPE_GATED_SECTIONS: ReadonlyMap<string, t.ScopeGateReason> = new Map<
-  string,
-  t.ScopeGateReason
->([
-  ...READ_ONLY_CONFIG_SECTIONS,
-  ...[...DEDICATED_CONFIG_SECTIONS].map((section): [string, t.ScopeGateReason] => [
-    section,
-    'tenantWide',
-  ]),
-  ...PRE_AUTH_SECTIONS.map((section): [string, t.ScopeGateReason] => [section, 'preAuth']),
-]);
-
-/** Why `path` (or its section) cannot be set per profile, if it can't. */
-export function getScopeGateReason(path: string): t.ScopeGateReason | undefined {
-  return SCOPE_GATED_SECTIONS.get(getConfigSection(path));
+export function getScopeGateReason(
+  path: string,
+  rules: t.ConfigWriteRules = BUNDLED_WRITE_RULES,
+): t.ScopeGateReason | undefined {
+  const section = getConfigSection(path);
+  if (PRE_AUTH_SECTIONS.has(section)) return 'preAuth';
+  if (DEDICATED_CONFIG_SECTIONS.has(section)) return 'tenantWide';
+  return rules.readOnlySections.get(section);
 }
+
+/** The admin user search needs at least this many characters. */
+export const MIN_USER_SEARCH_LENGTH = 2;
+
+/** The principal of the Base document: the admin overrides that apply to everyone. */
+export const BASE_PRINCIPAL: t.ConfigPrincipal = {
+  principalType: PrincipalType.ROLE,
+  principalId: BASE_CONFIG_PRINCIPAL_ID,
+};
+
+/** The kinds of principal a profile can be for, in the order pickers list them, with their headings. */
+export const SCOPE_PRINCIPAL_GROUPS: ReadonlyArray<t.ScopePrincipalGroup> = [
+  { type: PrincipalType.ROLE, headingKey: 'com_scope_roles' },
+  { type: PrincipalType.GROUP, headingKey: 'com_scope_groups' },
+  { type: PrincipalType.USER, headingKey: 'com_scope_users' },
+];

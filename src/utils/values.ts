@@ -40,8 +40,12 @@ const NO_VALUES_STATE: t.FieldState = {
   isHidden: false,
 };
 
-/** Title settings LibreChat reads from `endpoints.all` as a whole block whenever one exists. */
-const BLOCK_SHADOWED_KEYS: ReadonlySet<string> = new Set([
+/**
+ * Title settings. LibreChat reads them from `endpoints.all` as a whole block
+ * whenever one exists (`titleResolution: 'block'`), or per field like the
+ * settings below (`'field'`), with the title endpoint and model as one choice.
+ */
+const TITLE_KEYS: ReadonlySet<string> = new Set([
   'titleConvo',
   'titleModel',
   'titleMethod',
@@ -50,8 +54,13 @@ const BLOCK_SHADOWED_KEYS: ReadonlySet<string> = new Set([
   'titlePromptTemplate',
 ]);
 
-/** Activity and reasoning-label settings where a value in `endpoints.all` wins per field. */
+/** With `titleResolution: 'field'`, both come from the first layer that sets either. */
+const TITLE_ROUTING_KEYS: readonly string[] = ['titleEndpoint', 'titleModel'];
+
+/** Settings where a value in `endpoints.all` wins per field: title timing, stream rate, activity and reasoning labels. */
 const FIELD_SHADOWED_KEYS: ReadonlySet<string> = new Set([
+  'titleTiming',
+  'streamRate',
   'activityLabel',
   'activityModel',
   'activityEndpoint',
@@ -84,15 +93,21 @@ function sameValue(a: t.ConfigValue, b: t.ConfigValue): boolean {
 
 /**
  * The `endpoints.all` setting that takes precedence over a provider or custom
- * endpoint field (EV-8). Titles read the whole `all` block whenever one exists
- * (`endpoints.all ?? endpoints[x]`), so every per-endpoint title setting is
- * ignored, even one that `all` leaves unset. Activity and reasoning-label
- * settings resolve per field (`all[key] ?? endpoint[key]`).
+ * endpoint field (EV-8). Activity and reasoning-label settings resolve per
+ * field (`all[key] ?? endpoint[key]`). Titles, on a server that resolves them
+ * as a block (`titleResolution: 'block'`), read the whole `all` block
+ * whenever one exists (`endpoints.all ?? endpoints[x]`), so every
+ * per-endpoint title setting is ignored, even one that `all` leaves unset;
+ * on one that resolves them per field (`'field'`), only a title setting `all`
+ * sets wins, and the title endpoint and model are one choice: both come from
+ * `all` when it sets either, so the half `all` leaves unset points to the
+ * half it sets.
  */
 export function resolveShadowedBy(
   path: string,
   root: t.ConfigValue,
   editedValues: t.FlatConfigMap = {},
+  titleResolution: t.ConfigRules['titleResolution'] = 'block',
 ): t.ShadowedBy | undefined {
   const segments = path.split('.');
   if (segments[0] !== 'endpoints') return undefined;
@@ -102,14 +117,21 @@ export function resolveShadowedBy(
   const isCustomField =
     segments.length === 4 && segments[1] === 'custom' && INDEX_SEGMENT.test(segments[2]);
   if (!isProviderField && !isCustomField) return undefined;
-  const isBlock = BLOCK_SHADOWED_KEYS.has(key);
-  if (!isBlock && !FIELD_SHADOWED_KEYS.has(key)) return undefined;
+  const isTitle = TITLE_KEYS.has(key);
+  if (!isTitle && !FIELD_SHADOWED_KEYS.has(key)) return undefined;
   const all = getValueAtPath(root, 'endpoints.all');
   if (!isConfigRecord(all)) return undefined;
+  const valueOf = (name: string): t.ConfigValue => {
+    const allPath = `endpoints.all.${name}`;
+    return allPath in editedValues ? editedValues[allPath] : all[name];
+  };
   const allPath = `endpoints.all.${key}`;
-  const value = allPath in editedValues ? editedValues[allPath] : all[key];
-  if (isBlock) return { path: allPath, value, precedence: 'block' };
-  return value === undefined ? undefined : { path: allPath, value, precedence: 'field' };
+  const value = valueOf(key);
+  if (isTitle && titleResolution === 'block') return { path: allPath, value, precedence: 'block' };
+  if (value !== undefined) return { path: allPath, value, precedence: 'field' };
+  if (!isTitle || !TITLE_ROUTING_KEYS.includes(key)) return undefined;
+  const other = TITLE_ROUTING_KEYS.find((name) => name !== key && valueOf(name) !== undefined);
+  return other ? { path: `endpoints.all.${other}`, value, precedence: 'pair' } : undefined;
 }
 
 interface BaseReadout {
@@ -149,6 +171,8 @@ interface PathReader {
    * though their entry of the same name still serves as revert metadata.
    */
   replaces: (root: t.ConfigValue) => boolean;
+  /** Whether the path is inside an entry of a keyed list (not the entry itself). */
+  inEntry: boolean;
 }
 
 /**
@@ -204,6 +228,7 @@ function createReader(path: string, displayRoot: t.ConfigValue): PathReader {
         index.paths.has(path) ||
         (pathIndexOverlaps(index, path) && getValueAtPath(root, path) !== undefined),
       replaces: () => false,
+      inEntry: false,
     };
   }
   /** A redacted secret is returned as its preview companion (`apiKey` → `apiKeyPreview`). */
@@ -218,7 +243,26 @@ function createReader(path: string, displayRoot: t.ConfigValue): PathReader {
       (preview != null && keyedValue(root, preview) !== undefined),
     replaces: (root) =>
       location.replaced && Array.isArray(getValueAtPath(root, location.arrayPath)),
+    inEntry: location.rest !== '',
   };
+}
+
+/**
+ * `target`, what the layer beneath (`lower`) gives a path, as the edit
+ * target's own values merge over it: inside an entry the target removes
+ * values of by key (`ValueLayers.beneath`), without them, since removing
+ * the target's own value there leaves its removals in place. The entry
+ * itself keeps them: removing the override of a whole entry takes them back.
+ */
+function beneathTarget(
+  target: t.RevertTarget,
+  reader: PathReader,
+  layers: t.ValueLayers,
+  lower: t.ConfigValue,
+): t.RevertTarget {
+  if (!layers.beneath || !reader.inEntry) return target;
+  const value = reader.valueIn(layers.beneath);
+  return sameValue(value, reader.valueIn(lower)) ? target : { ...target, value };
 }
 
 /** What reaches users once a layer replaces the whole list: only the schema default. */
@@ -317,11 +361,14 @@ function deriveBaseModeState(
 ): t.FieldState {
   const reader = createReader(path, data.configValues ?? layers.effective);
   const base = readBase(path, layers, reader);
-  const revertTarget = base.isOverride || base.isHidden ? base.lower : undefined;
+  const revertTarget =
+    base.isOverride || base.isHidden
+      ? beneathTarget(base.lower, reader, layers, layers.yamlEffective)
+      : undefined;
   const revertValue = revertTarget ? revertTarget.value : base.effective;
   const pending = readPending(path, data.editedValues, revertValue);
   /** D5: LibreChat reads this section only from librechat.yaml, so a stored override has no effect. */
-  if (base.isOverride && getReadOnlyReason(path) === 'yamlOnly') {
+  if (base.isOverride && getReadOnlyReason(path, data.writeRules) === 'yamlOnly') {
     return {
       value: pending.isEdited ? pending.value : base.lower.value,
       effective: base.lower.value,
@@ -341,6 +388,7 @@ function deriveBaseModeState(
     path,
     data.configValues ?? layers.effective,
     data.editedValues,
+    data.titleResolution,
   );
   return {
     value: pending.isEdited ? pending.value : (shown ?? base.effective),
@@ -365,7 +413,12 @@ function deriveScopeModeState(
 ): t.FieldState {
   const reader = createReader(path, data.configValues ?? layers.effective);
   const base = readBase(path, layers, reader);
-  const inherited: t.RevertTarget = { value: base.effective, source: base.source };
+  const inherited = beneathTarget(
+    { value: base.effective, source: base.source },
+    reader,
+    layers,
+    layers.base,
+  );
   const isOverride = reader.sets(scope.overrides, scope.overridePaths);
   const visibility = data.visibilityEdits?.[path];
   const isHidden = visibility
@@ -390,6 +443,7 @@ function deriveScopeModeState(
     path,
     data.configValues ?? layers.effective,
     data.editedValues,
+    data.titleResolution,
   );
   return {
     value: pending.isEdited ? pending.value : (shown ?? effective),
@@ -488,7 +542,17 @@ export function deriveFieldValue(
 export function revertTargetAt(path: string, layers: t.ValueLayers): t.RevertTarget | undefined {
   const reader = createReader(path, layers.effective);
   const target: t.RevertTarget = layers.scope
-    ? { value: readBase(path, layers, reader).effective, source: 'inherited' }
-    : readLowerLayers(path, layers, reader, []).lower;
+    ? beneathTarget(
+        { value: readBase(path, layers, reader).effective, source: 'inherited' },
+        reader,
+        layers,
+        layers.base,
+      )
+    : beneathTarget(
+        readLowerLayers(path, layers, reader, []).lower,
+        reader,
+        layers,
+        layers.yamlEffective,
+      );
   return target.value === undefined ? undefined : target;
 }

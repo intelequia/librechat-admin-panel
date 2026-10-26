@@ -3,7 +3,8 @@ import { createContext, useContext } from 'react';
 import type { ReactNode } from 'react';
 import type * as t from '@/types';
 import { diffList, formatReviewValue, isListChange, isShowableSecret } from './format';
-import { cn, isConfigRecord } from '@/utils';
+import { cn, isConfigRecord, describeHiddenNameUses } from '@/utils';
+import { describeOverrideNotes } from '../values';
 import { useLocalize } from '@/hooks';
 
 /** The row's enum option labels, so values read as the page's options ("Remaining tokens"). */
@@ -48,6 +49,8 @@ const ENTRY_TITLE_KEYS: Partial<Record<t.ChangeKind, string>> = {
   removed: 'com_config_review_removed_entry',
   renamed: 'com_config_review_renamed_entry',
   reverted: 'com_config_review_reverted_entry',
+  hidden: 'com_config_review_hidden_entry',
+  unhidden: 'com_config_review_unhidden_entry',
 };
 
 const SOURCE_KEYS: Record<t.ProvenanceSource, string> = {
@@ -67,6 +70,11 @@ const WARNING_KEYS: Partial<Record<t.ChangeWarning, string>> = {
   emptySpecs: 'com_config_review_warning_empty_specs',
   shadowed: 'com_config_review_warning_shadowed',
   shadowedBlock: 'com_config_review_warning_shadowed_block',
+  shadowedPair: 'com_config_review_warning_shadowed_pair',
+  secretRebinding: 'com_config_review_warning_secret_rebinding',
+  secretRebindingEnter: 'com_config_review_warning_secret_rebinding_enter',
+  secretRestated: 'com_config_review_warning_secret_restated',
+  secretNotCopied: 'com_config_review_warning_secret_not_copied',
 };
 
 function ActionButton({
@@ -159,7 +167,7 @@ function LowerValue({ target, secret }: { target: t.RevertTarget; secret?: boole
   );
 }
 
-function SecretChange({ item }: { item: t.ChangeSummaryItem }) {
+function SecretChange({ item }: t.ChangeItemProps) {
   const localize = useLocalize();
   const format = useFormatValue();
   const before = item.before ?? item.revertTarget?.value;
@@ -189,6 +197,9 @@ function SecretChange({ item }: { item: t.ChangeSummaryItem }) {
     : localize(
         before == null ? 'com_config_review_secret_set' : 'com_config_review_secret_replaced',
       );
+  /** A stored key replaced by a value the review may show: the stored one reads struck through. */
+  const replacesStored =
+    before != null && !isShowableSecret(before) && isShowableSecret(item.after);
   return (
     <span className="flex flex-wrap items-center gap-1">
       {before != null && isShowableSecret(before) && (
@@ -199,12 +210,20 @@ function SecretChange({ item }: { item: t.ChangeSummaryItem }) {
           <Arrow />
         </>
       )}
+      {replacesStored && (
+        <>
+          <Value muted strike>
+            {localize('com_config_review_secret_stored')}
+          </Value>
+          <Arrow />
+        </>
+      )}
       <Value>{afterText}</Value>
     </span>
   );
 }
 
-function ListChange({ item }: { item: t.ChangeSummaryItem }) {
+function ListChange({ item }: t.ChangeItemProps) {
   const localize = useLocalize();
   const format = useFormatValue();
   const before = item.before ?? item.revertTarget?.value;
@@ -243,16 +262,46 @@ function ListChange({ item }: { item: t.ChangeSummaryItem }) {
   );
 }
 
-/** A hidden inherited value ("1,000,000 (Base) → Hidden"), or one shown again ("Hidden → inherits 1,000,000 from Base"). */
-function VisibilityChange({ item }: { item: t.ChangeSummaryItem }) {
+/**
+ * What a value shown again reads as: the value the same save writes there
+ * (`after`), else the one it inherits again, else not set.
+ */
+function ShownValue({ item }: t.ChangeItemProps) {
   const localize = useLocalize();
+  const format = useFormatValue();
+  if (item.after !== undefined) {
+    const hidesValue = item.secret && !isShowableSecret(item.after);
+    return (
+      <Value>{hidesValue ? localize('com_config_review_secret_set') : format(item.after)}</Value>
+    );
+  }
+  if (item.revertTarget) return <LowerValue target={item.revertTarget} secret={item.secret} />;
+  return <Value>{localize('com_config_field_not_set')}</Value>;
+}
+
+/**
+ * A hidden inherited value ("1,000,000 (Base) → Hidden"), or one shown
+ * again ("Hidden → inherits 1,000,000 from Base", or "Hidden → 2,000,000"
+ * where the same save writes its own value there). Where the target sets its
+ * own value there (`before`), that is what its users get now, struck through.
+ */
+function VisibilityChange({ item }: t.ChangeItemProps) {
+  const localize = useLocalize();
+  const format = useFormatValue();
   const hidden = (
     <Value muted={item.kind === 'unhidden'}>{localize('com_config_review_hidden')}</Value>
   );
+  const own =
+    item.before !== undefined ? (
+      <Value muted strike>
+        {format(item.before)}
+      </Value>
+    ) : null;
   if (item.kind === 'hidden') {
     return (
       <span className="flex flex-wrap items-center gap-1">
-        {item.revertTarget && <LowerValue target={item.revertTarget} secret={item.secret} />}
+        {own ??
+          (item.revertTarget && <LowerValue target={item.revertTarget} secret={item.secret} />)}
         <Arrow />
         {hidden}
       </span>
@@ -260,19 +309,15 @@ function VisibilityChange({ item }: { item: t.ChangeSummaryItem }) {
   }
   return (
     <span className="flex flex-wrap items-center gap-1">
-      {hidden}
+      {own ?? hidden}
       <Arrow />
-      {item.revertTarget ? (
-        <LowerValue target={item.revertTarget} secret={item.secret} />
-      ) : (
-        <Value>{localize('com_config_field_not_set')}</Value>
-      )}
+      <ShownValue item={item} />
     </span>
   );
 }
 
 /** BEFORE → AFTER for one value, with the layer it reverts to or inherits from. */
-function ValueChange({ item, isScope }: { item: t.ChangeSummaryItem; isScope: boolean }) {
+function ValueChange({ item, isScope }: t.ScopedChangeItemProps) {
   const localize = useLocalize();
   const format = useFormatValue();
   if (item.kind === 'hidden' || item.kind === 'unhidden') return <VisibilityChange item={item} />;
@@ -327,8 +372,32 @@ function Warning({ children }: { children: ReactNode }) {
   );
 }
 
+/** What a hidden custom endpoint takes with it: its model specs, and its name in the endpoint lists. */
+function describeHiddenUses(
+  uses: t.HiddenEndpointUses | undefined,
+  localize: t.LocalizeFn,
+): string[] {
+  if (!uses) return [];
+  return [
+    ...(uses.specs.length > 0
+      ? [localize('com_config_review_hidden_specs', { specs: uses.specs.join(', ') })]
+      : []),
+    ...describeHiddenNameUses(uses, localize),
+  ];
+}
+
 /** Warnings worded for the target: turning on required terms reads differently in a profile. */
 function warningKey(warning: t.ChangeWarning, isScope: boolean): string | undefined {
+  if (warning === 'hideDeletesOwn') {
+    return isScope
+      ? 'com_config_review_warning_hide_deletes_own_scope'
+      : 'com_config_review_warning_hide_deletes_own';
+  }
+  if (warning === 'deletesOwnValue') {
+    return isScope
+      ? 'com_config_review_warning_deletes_own_value_scope'
+      : 'com_config_review_warning_deletes_own_value';
+  }
   if (warning === 'requireTerms') {
     return isScope
       ? 'com_config_terms_acceptance_import_scope'
@@ -338,18 +407,28 @@ function warningKey(warning: t.ChangeWarning, isScope: boolean): string | undefi
 }
 
 /** Row warnings, and the value saved meanwhile when someone else changed it since the edit (SV-8). */
-function RowWarnings({ item, isScope }: { item: t.ChangeSummaryItem; isScope: boolean }) {
+function RowWarnings({ item, isScope }: t.ScopedChangeItemProps) {
   const localize = useLocalize();
   const format = useFormatValue();
   const keys = (item.warnings ?? [])
     .map((warning) => warningKey(warning, isScope))
     .filter((key): key is string => key != null);
+  const profileNotes = describeOverrideNotes(item.overrideNotes ?? [], localize);
+  const hiddenNotes = describeHiddenUses(item.hiddenUses, localize);
   const drift = item.drift;
-  if (keys.length === 0 && !drift) return null;
+  if (keys.length === 0 && profileNotes.length === 0 && hiddenNotes.length === 0 && !drift) {
+    return null;
+  }
   return (
     <>
       {keys.map((key) => (
         <Warning key={key}>{localize(key)}</Warning>
+      ))}
+      {hiddenNotes.map((note) => (
+        <Warning key={note}>{note}</Warning>
+      ))}
+      {profileNotes.map((note) => (
+        <Warning key={note}>{note}</Warning>
       ))}
       {drift && (
         <Warning>
@@ -376,6 +455,24 @@ function RowIssues({ issues }: { issues?: t.ReviewIssue[] }) {
       ))}
     </ul>
   );
+}
+
+/** A detail under a row: a leaf of an added entry, or a part the change deletes with it. */
+function DetailValue({ detail }: t.ReviewDetailValueProps) {
+  const localize = useLocalize();
+  const { item } = detail;
+  if (item.kind === 'removed') {
+    if (item.secret) return <>{localize('com_config_review_secret_removed')}</>;
+    return (
+      <span className="line-through decoration-(--cui-color-text-muted)">
+        {formatReviewValue(item.before, localize, detail.valueLabels)}
+      </span>
+    );
+  }
+  if (item.secret && !isShowableSecret(item.after)) {
+    return <>{localize('com_config_review_secret_set')}</>;
+  }
+  return <>{formatReviewValue(item.after, localize, detail.valueLabels)}</>;
 }
 
 /** One change of the review: its label, BEFORE → AFTER, warnings, problems, and Revert / Go to field. */
@@ -445,9 +542,7 @@ export function ChangeRow({
                 <div key={detail.key} className="contents">
                   <dt className="text-(--cui-color-text-muted)">{detail.label}</dt>
                   <dd className="m-0 min-w-0 font-mono wrap-anywhere text-(--cui-color-text-default)">
-                    {detail.item.secret && !isShowableSecret(detail.item.after)
-                      ? localize('com_config_review_secret_set')
-                      : formatReviewValue(detail.item.after, localize, detail.valueLabels)}
+                    <DetailValue detail={detail} />
                   </dd>
                 </div>
               ))}

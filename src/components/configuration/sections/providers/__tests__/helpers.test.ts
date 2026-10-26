@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { maskCredential, toAzureGroups } from '../azure';
+import { BUNDLED_CONFIG_FEATURES } from '@/constants';
 import { createField } from '@/test/fixtures';
 import { providerTocItems } from '../layout';
 import { providerStatus } from '../status';
@@ -52,6 +53,13 @@ describe('maskCredential', () => {
     expect(maskCredential('prefix-${A}')).toEqual({ kind: 'masked' });
     expect(maskCredential(undefined)).toEqual({ kind: 'none' });
   });
+
+  it('reads a key the server hides by its preview (azureGroupSecrets)', () => {
+    expect(maskCredential(undefined, '...1234')).toEqual({ kind: 'stored', preview: '...1234' });
+    expect(maskCredential(undefined, '********')).toEqual({ kind: 'masked' });
+    const [row] = toAzureGroups([{ group: 'eastus', apiKeyPreview: '...1234' }]);
+    expect(row).toMatchObject({ apiKey: undefined, apiKeyPreview: '...1234', others: {} });
+  });
 });
 
 describe('addressIssue', () => {
@@ -81,6 +89,25 @@ describe('providerStatus', () => {
       credentialsKey: 'com_config_providers_creds_assistants',
     });
     expect(providerStatus('openAI', undefined).kind).toBe('unknown');
+  });
+
+  it('names the keys stored with Azure groups only where the panel edits them (editsAzureGroups)', () => {
+    const rederive = {
+      ...BUNDLED_CONFIG_FEATURES,
+      endpointRederive: true,
+      azureGroupMergeKey: true,
+      azureGroupSecrets: true,
+    };
+    expect(providerStatus('azureOpenAI', endpoints, rederive).credentialsKey).toBe(
+      'com_config_providers_creds_azureOpenAI_groups',
+    );
+    expect(
+      providerStatus('azureOpenAI', endpoints, { ...rederive, endpointRederive: false })
+        .credentialsKey,
+    ).toBe('com_config_providers_creds_azureOpenAI');
+    expect(providerStatus('azureOpenAI', endpoints).credentialsKey).toBe(
+      'com_config_providers_creds_azureOpenAI',
+    );
   });
 });
 

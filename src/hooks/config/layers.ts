@@ -2,23 +2,26 @@ import { useMemo } from 'react';
 import { queryOptions, useQuery } from '@tanstack/react-query';
 import type * as t from '@/types';
 import {
+  mergesByKey,
+  flattenObject,
+  getValueAtPath,
+  withScopeLayer,
+  createBaseLayers,
+  keyedEntriesOf,
+  overlayPendingEdits,
+  overriddenEntryKeys,
+} from '@/utils';
+import {
   baseConfigOptions,
   getResolvedConfigFn,
   getLangfuseConnectionFn,
   LANGFUSE_CONNECTION_QUERY_KEY,
 } from '@/server';
-import {
-  flattenObject,
-  getValueAtPath,
-  withScopeLayer,
-  createBaseLayers,
-  overlayPendingEdits,
-  overriddenEntryKeys,
-} from '@/utils';
-import { KEYED_COLLECTIONS } from '@/constants';
 import { collectFieldPaths, withLangfuseConfiguredPath } from '@/components/configuration/counts';
 import { mergeIndexedArrayEdits } from '@/components/configuration/edits';
 import { getFieldMeta } from '@/components/configuration/meta';
+import { useConfigFeatures, useConfigWriteRules } from './contract';
+import { KEYED_COLLECTIONS } from '@/constants';
 
 const INDEXED_EDIT_PATH = /\.\d+$/;
 
@@ -27,9 +30,10 @@ export function runtimeDefaultAt(path: string): t.ConfigValue {
   return getFieldMeta(path)?.runtimeDefault;
 }
 
-export function resolvedConfigOptions(scope: t.ScopeSelection) {
-  const principalType = scope.type === 'SCOPE' ? scope.scope.principalType : null;
-  const principalId = scope.type === 'SCOPE' ? scope.scope.principalId : null;
+/** A profile's own config document (its overrides and tombstones); idle without a principal. */
+export function scopeConfigOptions(principal: t.ConfigPrincipal | null) {
+  const principalType = principal?.principalType ?? null;
+  const principalId = principal?.principalId ?? null;
   return queryOptions({
     queryKey: ['resolvedConfig', principalType, principalId] as const,
     queryFn: () =>
@@ -42,6 +46,10 @@ export function resolvedConfigOptions(scope: t.ScopeSelection) {
     enabled: principalType != null && principalId != null,
     staleTime: 60_000,
   });
+}
+
+export function resolvedConfigOptions(scope: t.ScopeSelection) {
+  return scopeConfigOptions(scope.type === 'SCOPE' ? scope.scope : null);
 }
 
 /**
@@ -69,11 +77,16 @@ export function useConfigLayers({
   const fieldPaths = useMemo(() => collectFieldPaths(schemaTree), [schemaTree]);
   const schemaPathSet = useMemo(() => new Set(fieldPaths), [fieldPaths]);
 
+  const features = useConfigFeatures();
+  const { keyedTombstones, specInterfaceRederive } = features;
+
   /** Base-mode layers: librechat.yaml (raw paths and processed), base overrides and tombstones, effective base. */
   const baseLayers = useMemo(
     () =>
-      baseConfigData ? createBaseLayers(baseConfigData, schemaPathSet, runtimeDefaultAt) : null,
-    [baseConfigData, schemaPathSet],
+      baseConfigData
+        ? createBaseLayers(baseConfigData, schemaPathSet, runtimeDefaultAt, keyedTombstones)
+        : null,
+    [baseConfigData, schemaPathSet, keyedTombstones],
   );
 
   const dbOverridePaths = useMemo(
@@ -101,13 +114,31 @@ export function useConfigLayers({
 
   const scopeQuery = useQuery(resolvedConfigOptions(selectedScope));
   const scopeData = isEditingScope ? scopeQuery.data : undefined;
+  const writeRules = useConfigWriteRules();
 
   /** Profile mode: Base merged with the profile's overrides, minus its tombstones (null until both load). */
   const valueLayers = useMemo((): t.ValueLayers | null => {
     if (!baseLayers || !isEditingScope) return baseLayers;
     if (!openScope || !scopeData) return null;
-    return withScopeLayer(baseLayers, openScope, scopeData, schemaPathSet);
-  }, [baseLayers, isEditingScope, openScope, scopeData, schemaPathSet]);
+    return withScopeLayer(
+      baseLayers,
+      openScope,
+      scopeData,
+      schemaPathSet,
+      writeRules,
+      keyedTombstones,
+      specInterfaceRederive,
+    );
+  }, [
+    baseLayers,
+    isEditingScope,
+    openScope,
+    scopeData,
+    schemaPathSet,
+    writeRules,
+    keyedTombstones,
+    specInterfaceRederive,
+  ]);
 
   /**
    * Overridden entries of each keyed list, by the edit target: Base's
@@ -121,6 +152,7 @@ export function useConfigLayers({
     const lower = scopeLayer ? (valueLayers?.base ?? null) : (baseConfigData?.yamlConfig ?? null);
     const counts = new Map<string, number>();
     for (const collection of KEYED_COLLECTIONS.values()) {
+      if (collection.merge === 'byKey' && !mergesByKey(collection, features)) continue;
       const storedList = getValueAtPath(stored, collection.path);
       if (scopeLayer && collection.merge === 'replace') {
         counts.set(collection.path, Array.isArray(storedList) ? 1 : 0);
@@ -131,10 +163,14 @@ export function useConfigLayers({
         storedList,
         getValueAtPath(lower, collection.path),
       );
+      const tombstones = scopeLayer?.tombstones ?? valueLayers?.baseTombstones ?? [];
+      for (const keyed of keyedTombstones ? keyedEntriesOf(tombstones, collection) : []) {
+        keys.add(keyed);
+      }
       counts.set(collection.path, keys.size);
     }
     return counts;
-  }, [valueLayers, dbOverrides, baseConfigData?.yamlConfig]);
+  }, [valueLayers, dbOverrides, baseConfigData?.yamlConfig, keyedTombstones, features]);
 
   const baseActiveConfigValues = isEditingScope ? (valueLayers?.effective ?? null) : configValues;
   const flatBaseline = useMemo(
@@ -194,6 +230,7 @@ export function useConfigLayers({
     overridePaths: isEditingScope ? scopeOverridePaths : dbOverridePaths,
     listOverrideCounts,
     valueLayers,
+    targetRevision: isEditingScope ? scopeData?.revision : baseConfigData?.dbRevision,
   };
 }
 

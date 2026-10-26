@@ -9,12 +9,13 @@ import type {
   SkipReason,
   FieldValidationError,
 } from './config';
+import type { ReportedIssue, ReportedLocation, ReportedSkip, VisibilityEdit } from './changes';
 import type { ConfigScope, ScopeGateReason, ScopeSelection, ScopePermissions } from './scope';
 import type { TocEntry, JumpTarget, ConfigSearchHit, ConfigSearchItem } from './shell';
 import type { BaseOverridesState, ImportSkippedKey, ImportRequest } from './review';
 import type { TabBadge, PathIndex, ValueLayers } from './values';
 import type { FieldControlProps } from './controls';
-import type { VisibilityEdit } from './changes';
+import type { ConfigWriteRules } from './contract';
 
 export interface ConfigTab {
   id: string;
@@ -125,7 +126,7 @@ export interface ConfigTabContentProps {
   /** See `FieldRendererProps.onUnhideField`. */
   onUnhideField?: (path: string) => void;
   /** See `FieldRendererProps.onRenameEntry`. */
-  onRenameEntry?: (from: string, to: string | null) => void;
+  onRenameEntry?: (from: string, to: string | null, copy?: boolean) => void;
   /** While the tab filter is active: the sections holding a match (WS5). */
   visibleSectionIds?: Set<string>;
   /** While the tab filter is active: the data paths that match; other rows are hidden (WS5). */
@@ -270,6 +271,9 @@ export interface HeaderActionsProps {
   resetDisabled: boolean;
   resetTitle?: string;
   onResetClick: () => void;
+  /** Offers "Preview", the configuration a role, group or user gets. */
+  showPreview?: boolean;
+  onPreviewClick?: () => void;
   showScope: boolean;
   scopeSelection: ScopeSelection;
   /** The profile a `?scope=` link names is still being looked up. */
@@ -387,10 +391,11 @@ export interface FieldRendererProps {
   onUnhideField?: (path: string) => void;
   /**
    * Records that a record entry was renamed (`mcpServers.a` → `mcpServers.b`),
-   * so the review pairs them; `to: null` drops the record of `from` (the
-   * renamed entry was deleted, and Undo records the rename again).
+   * so the review pairs them and Save carries its stored secrets, or with
+   * `copy` duplicated; `to: null` drops the record of `from` (the renamed
+   * entry was deleted, and Undo records the rename again).
    */
-  onRenameEntry?: (from: string, to: string | null) => void;
+  onRenameEntry?: (from: string, to: string | null, copy?: boolean) => void;
 }
 
 /** Where a save or import is written: base (all users) or one profile. */
@@ -528,6 +533,8 @@ export interface SaveContext {
   hasOverride: (path: string) => boolean;
   /** Whether the edit target is a profile, whose values beneath come from Base (not librechat.yaml). */
   isScope?: boolean;
+  /** The server's write rules (`getWriteRules`); the bundled ones when absent. */
+  writeRules?: ConfigWriteRules;
 }
 
 /** Result of the server-side pre-flight that runs before any write. */
@@ -540,11 +547,36 @@ export interface ConfigCheckResult {
 export interface PatchFieldsResponse {
   error?: string;
   message?: string;
-  /** `CONFIG_OVERRIDE_INVALID` when the admin API rejected the values (see `issues`). */
+  /** `CONFIG_OVERRIDE_INVALID` when the admin API rejected the values (see `issues`), or why it refused the write. */
   code?: string;
   /** Paths (YAML keys, array indices of the sent value) and stable codes of rejected values. */
-  issues?: Array<{ path: string; code: string }>;
+  issues?: ReportedIssue[];
   config?: { overrides?: ConfigRecord; tombstones?: string[] } | null;
+  /** `writeReport`: the locations the write stored or removed. */
+  applied?: ReportedLocation[];
+  /** `writeReport`: the locations, or parts of a written value, the write did not store. */
+  skipped?: ReportedSkip[];
+  /** Stored values the runtime merge leaves out (`secret_rebinding`, …). */
+  ignored?: ReportedSkip[];
+  /** `MCP_API_KEY_REENTRY_REQUIRED` / `MCP_OAUTH_SECRET_REENTRY_REQUIRED`: the server whose secret to enter again. */
+  server?: string;
+  /** With `server`: the settings the write changed that decide where the secret is sent. */
+  fields?: string[];
+  /** `CONFIG_RENAME_INVALID`: why a `renames` hint can't apply (`duplicate_source`, `target_exists`, …). */
+  reason?: string;
+}
+
+/** Body of a `POST …/changes` reply (`changesBatch`): the stored document's revision and what the batch did. */
+export interface ChangesBatchResponse extends PatchFieldsResponse {
+  config?: { overrides?: ConfigRecord; tombstones?: string[]; revision?: string } | null;
+  /** The stored document's revision after the batch; `null` when the target has none. */
+  revision?: string | null;
+  /** Whether a document was written: a batch that changes nothing writes nothing. */
+  written?: boolean;
+  /** A refused change of the batch (400), by position in the sent ops. */
+  opIndex?: number;
+  /** `CONFIG_VERSION_CONFLICT` (409): the revision stored now. */
+  currentRevision?: string | null;
 }
 
 /** Outcome of a save call: how many entries the backend applied and which were dropped. */
@@ -554,7 +586,22 @@ export interface ConfigWriteResult {
   skipped: SkippedChange[];
 }
 
+/**
+ * Why a field is managed only in librechat.yaml: read once at startup, kept
+ * from librechat.yaml whatever an override stores (the server's base-only
+ * paths), or not re-processed after overrides.
+ */
+export type ManagedNoticeKind = 'startup' | 'baseOnly' | 'yaml';
+
 export interface ManagedNoticeProps {
+  /**
+   * `startup`: LibreChat reads the field only at startup (`STARTUP_ONLY_FIELDS`);
+   * `baseOnly`: the server keeps librechat.yaml's value (`rules.baseOnlyPaths`);
+   * `yaml` by default.
+   */
+  kind?: ManagedNoticeKind;
+  /** How many settings the notice covers (consecutive startup-only fields share one). */
+  count?: number;
   /** The edit target holds its own (ignored) override for the field. */
   hasOverride: boolean;
   /** Removal of that override is already queued for the next save. */

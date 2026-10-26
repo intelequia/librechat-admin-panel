@@ -9,13 +9,24 @@ import type {
   AdminUserListItem,
 } from '@librechat/data-schemas';
 import type * as t from '@/types';
-import { collectOverridePaths, scopeOverrideEntries, stripSecretPreviewValues } from '@/utils';
+import {
+  ABSENT_REVISION,
+  MAX_SCOPE_PRIORITY,
+  VERSION_CONFLICT_CODE,
+  DEFAULT_SCOPE_PRIORITY,
+} from '@/constants';
+import {
+  findStoredSecrets,
+  collectOverridePaths,
+  scopeOverrideEntries,
+  stripSecretPreviewValues,
+} from '@/utils';
 import { normalizeAppServiceKeys } from '../config/normalize';
-import { apiErrorMessage, apiFetch } from '../utils/api';
+import { apiErrorBodyMessage, apiErrorMessage, apiFetch } from '../utils/api';
 import { BASE_CONFIG_PRINCIPAL_ID } from '../constants';
-import { requireAnyCapability } from '../capabilities';
-import { DEFAULT_SCOPE_PRIORITY } from '@/constants';
+import { requireCapability, requireAnyCapability } from '../capabilities';
 import { getSchemaPathSet } from '../config/schema';
+import { readConfigContract } from '../config/meta';
 import { deepGet } from './paths';
 
 /** The admin list endpoints return at most this many items per page. */
@@ -40,23 +51,31 @@ function principalKey(principalType: PrincipalType, principalId: string): string
 
 /**
  * What a stored profile overrides: its leaf paths (secret previews and
- * permission fields left out) and the entries it stores in lists merged by entry.
+ * permission fields left out), the entries it stores in lists merged by
+ * entry with the settings each sets, and the secrets it stores (by where
+ * their previews are).
  */
 function profileOverrides(
   config: t.ScopeConfigDoc,
-): Pick<t.ConfigScope, 'overridePaths' | 'overrideEntries'> {
+  features?: t.ConfigFeatures,
+): Pick<
+  t.ConfigScope,
+  'overridePaths' | 'overrideEntries' | 'overrideEntryPaths' | 'storedSecrets'
+> {
   const overrides = (config.overrides ?? {}) as t.ConfigRecord;
   const visible = stripSecretPreviewValues(overrides, '', getSchemaPathSet()) as t.ConfigRecord;
   const normalized = normalizeAppServiceKeys(visible);
   return {
     overridePaths: collectOverridePaths(normalized),
-    overrideEntries: scopeOverrideEntries(normalized),
+    ...scopeOverrideEntries(normalized, features),
+    storedSecrets: findStoredSecrets(normalizeAppServiceKeys(overrides)),
   };
 }
 
 function apiConfigToScope(
   config: t.ScopeConfigDoc,
   directory?: ReadonlyMap<string, t.PrincipalDetails>,
+  features?: t.ConfigFeatures,
 ): t.ConfigScope {
   const details = directory?.get(principalKey(config.principalType, config.principalId));
   return {
@@ -68,7 +87,7 @@ function apiConfigToScope(
     ...(details?.memberCount != null && { memberCount: details.memberCount }),
     priority: config.priority,
     isActive: config.isActive,
-    ...profileOverrides(config),
+    ...profileOverrides(config, features),
     tombstones: config.tombstones ?? [],
   };
 }
@@ -178,14 +197,19 @@ export async function resolvePrincipals(
  * the user's email, member counts, and the paths it overrides or hides.
  */
 export const getAvailableScopesFn = createServerFn({ method: 'GET' }).handler(async () => {
-  const configRes = await apiFetch('/api/admin/config');
+  const [configRes, contract] = await Promise.all([
+    apiFetch('/api/admin/config'),
+    readConfigContract(),
+  ]);
   if (!configRes.ok) {
     throw new Error(`Failed to fetch scopes: ${configRes.status}`);
   }
   const { configs } = (await configRes.json()) as { configs: t.ScopeConfigDoc[] };
   const profiles = configs.filter((c) => c.principalId !== BASE_CONFIG_PRINCIPAL_ID);
   const directory = await resolvePrincipals(profiles);
-  const scopes: t.ConfigScope[] = profiles.map((c) => apiConfigToScope(c, directory));
+  const scopes: t.ConfigScope[] = profiles.map((c) =>
+    apiConfigToScope(c, directory, contract.features),
+  );
   return { scopes };
 });
 
@@ -209,7 +233,7 @@ export const MISSING_SCOPE_MESSAGE =
  * Fetches all configs and extracts the field value from each config's overrides.
  */
 export const getFieldProfileValuesFn = createServerFn({ method: 'GET' })
-  .inputValidator(z.object({ fieldPath: z.string() }))
+  .validator(z.object({ fieldPath: z.string() }))
   .handler(async ({ data }: { data: { fieldPath: string } }) => {
     const response = await apiFetch('/api/admin/config');
     if (!response.ok) {
@@ -238,13 +262,95 @@ export const fieldProfileValuesOptions = (fieldPath: string) =>
     queryFn: () => getFieldProfileValuesFn({ data: { fieldPath } }).then((r) => r.values),
   });
 
+/** The admin API's code for a create-only PUT for a principal that does not exist. */
+const PRINCIPAL_NOT_FOUND_CODE = 'PRINCIPAL_NOT_FOUND';
+
+function missingRoleMessage(principalId: string): string {
+  return `There is no role named "${principalId}"`;
+}
+
+/** A created or existing profile's document from a reply, or an error when it carries none. */
+async function readConfigDoc(response: Response): Promise<t.ScopeConfigDoc> {
+  const body = (await response.json()) as AdminConfigResponse | { message?: string };
+  const config = 'config' in body ? body.config : undefined;
+  if (!config?._id) {
+    throw new Error(
+      'Backend did not return a config document. The scope may not have been created.',
+    );
+  }
+  return config;
+}
+
+/**
+ * Before `expectedRevision`: reads the principal's profile and returns it
+ * when there is one, else checks that a role exists (the admin API would
+ * create a profile for any name) and creates the profile with a PUT. A
+ * profile created by someone else between the read and the PUT is
+ * overwritten with an empty one.
+ */
+async function createScopeLegacy(
+  url: string,
+  data: t.CreateScopeInput,
+  principalId: string,
+  priority: number,
+): Promise<t.ScopeConfigDoc> {
+  const existing = await apiFetch(url);
+  if (existing.ok) return ((await existing.json()) as AdminConfigResponse).config;
+  if (data.principalType === PrincipalType.ROLE) {
+    const role = await apiFetch(`/api/admin/roles/${encodeURIComponent(principalId)}`);
+    if (role.status === 404) throw new Error(missingRoleMessage(principalId));
+  }
+  const response = await apiFetch(url, {
+    method: 'PUT',
+    body: JSON.stringify({ overrides: {}, priority }),
+  });
+  if (!response.ok) throw new Error(await apiErrorMessage(response, 'Failed to create scope'));
+  return readConfigDoc(response);
+}
+
+/**
+ * With `expectedRevision`: one create-only PUT (`expectedRevision: 'absent'`),
+ * so a profile created meanwhile is never overwritten; when one exists
+ * (409) it is read and returned. With `principalCheck` the admin API refuses
+ * a principal that doesn't exist (404 `PRINCIPAL_NOT_FOUND`), so the role
+ * is not looked up first.
+ */
+async function createScopeOnce(
+  url: string,
+  data: t.CreateScopeInput,
+  principalId: string,
+  priority: number,
+  principalCheck: boolean,
+): Promise<t.ScopeConfigDoc> {
+  if (!principalCheck && data.principalType === PrincipalType.ROLE) {
+    const role = await apiFetch(`/api/admin/roles/${encodeURIComponent(principalId)}`);
+    if (role.status === 404) throw new Error(missingRoleMessage(principalId));
+  }
+  const response = await apiFetch(url, {
+    method: 'PUT',
+    body: JSON.stringify({ overrides: {}, priority, expectedRevision: ABSENT_REVISION }),
+  });
+  if (response.ok) return readConfigDoc(response);
+  const body = (await response.json().catch(() => ({}))) as t.ApiErrorBody;
+  if (response.status === 409 && body.code === VERSION_CONFLICT_CODE) {
+    const existing = await apiFetch(url);
+    if (existing.ok) return ((await existing.json()) as AdminConfigResponse).config;
+  }
+  if (body.code === PRINCIPAL_NOT_FOUND_CODE && data.principalType === PrincipalType.ROLE) {
+    throw new Error(missingRoleMessage(principalId));
+  }
+  throw new Error(apiErrorBodyMessage(body, response.status, 'Failed to create scope'));
+}
+
 /**
  * Create a profile for a role, group or user. The priority defaults to
  * `DEFAULT_SCOPE_PRIORITY` for the principal type. When the principal already
- * has a profile it is returned as is, so creating never replaces overrides.
+ * has a profile it is returned as is, so creating never replaces overrides:
+ * atomically on a server with `expectedRevision` (`createScopeOnce`), else
+ * by reading first (`createScopeLegacy`).
  */
 export const createScopeFn = createServerFn({ method: 'POST' })
-  .inputValidator(
+  .validator(
     z
       .object({
         principalType: z.nativeEnum(PrincipalType),
@@ -262,64 +368,62 @@ export const createScopeFn = createServerFn({ method: 'POST' })
         path: ['principalId'],
       }),
   )
+  .handler(async ({ data }: { data: t.CreateScopeInput }) => {
+    await requireAnyCapability([
+      SystemCapabilities.ASSIGN_CONFIGS,
+      SystemCapabilities.MANAGE_CONFIGS,
+    ]);
+    const principalId =
+      data.principalId ??
+      (data.principalType === PrincipalType.ROLE
+        ? data.name.toLowerCase().replace(/\s+/g, '_')
+        : `grp_${data.name.toLowerCase().replace(/\s+/g, '_')}`);
+    const url = `/api/admin/config/${data.principalType}/${encodeURIComponent(principalId)}`;
+    const priority =
+      data.priority ?? DEFAULT_SCOPE_PRIORITY[data.principalType as t.ScopePrincipalType];
+    const { features } = await readConfigContract();
+    const config = features.expectedRevision
+      ? await createScopeOnce(url, data, principalId, priority, features.principalCheck)
+      : await createScopeLegacy(url, data, principalId, priority);
+    return {
+      scope: {
+        ...apiConfigToScope(config, undefined, features),
+        name: data.name,
+        ...(data.email && { email: data.email }),
+        ...(data.principalType === PrincipalType.GROUP && { memberCount: 0 }),
+      },
+    };
+  });
+
+/**
+ * Sets only a profile's priority (`priorityRoute`, D6): its overrides,
+ * hidden settings and active state stay as stored. Broad `manage:configs`
+ * only, like every priority change.
+ */
+export const setScopePriorityFn = createServerFn({ method: 'POST' })
+  .validator(
+    z.object({
+      principalType: z.nativeEnum(PrincipalType),
+      principalId: z.string().min(1),
+      priority: z.number().int().min(0).max(MAX_SCOPE_PRIORITY),
+    }),
+  )
   .handler(
     async ({
       data,
     }: {
-      data: {
-        principalType: PrincipalType;
-        name: string;
-        priority?: number;
-        principalId?: string;
-        email?: string;
-      };
+      data: { principalType: PrincipalType; principalId: string; priority: number };
     }) => {
-      await requireAnyCapability([
-        SystemCapabilities.ASSIGN_CONFIGS,
-        SystemCapabilities.MANAGE_CONFIGS,
-      ]);
-      const principalId =
-        data.principalId ??
-        (data.principalType === PrincipalType.ROLE
-          ? data.name.toLowerCase().replace(/\s+/g, '_')
-          : `grp_${data.name.toLowerCase().replace(/\s+/g, '_')}`);
-      const url = `/api/admin/config/${data.principalType}/${encodeURIComponent(principalId)}`;
-      const toScope = (config: t.ScopeConfigDoc): t.ConfigScope => ({
-        ...apiConfigToScope(config),
-        name: data.name,
-        ...(data.email && { email: data.email }),
-        ...(data.principalType === PrincipalType.GROUP && { memberCount: 0 }),
-      });
-
-      const existing = await apiFetch(url);
-      if (existing.ok) {
-        const { config } = (await existing.json()) as AdminConfigResponse;
-        return { scope: toScope(config) };
-      }
-      if (data.principalType === PrincipalType.ROLE) {
-        const role = await apiFetch(`/api/admin/roles/${encodeURIComponent(principalId)}`);
-        if (role.status === 404) throw new Error(`There is no role named "${principalId}"`);
-      }
-
-      const priority =
-        data.priority ?? DEFAULT_SCOPE_PRIORITY[data.principalType as t.ScopePrincipalType];
-      const response = await apiFetch(url, {
-        method: 'PUT',
-        body: JSON.stringify({ overrides: {}, priority }),
-      });
-
+      await requireCapability(SystemCapabilities.MANAGE_CONFIGS);
+      const response = await apiFetch(
+        `/api/admin/config/${data.principalType}/${encodeURIComponent(data.principalId)}/priority`,
+        { method: 'PATCH', body: JSON.stringify({ priority: data.priority }) },
+      );
       if (!response.ok) {
-        throw new Error(await apiErrorMessage(response, 'Failed to create scope'));
+        throw new Error(await apiErrorMessage(response, 'Failed to change the priority'));
       }
-
-      const body = (await response.json()) as AdminConfigResponse | { message?: string };
-      const config = 'config' in body ? body.config : undefined;
-      if (!config?._id) {
-        throw new Error(
-          'Backend did not return a config document. The scope may not have been created.',
-        );
-      }
-      return { scope: toScope(config) };
+      const config = await readConfigDoc(response);
+      return { priority: config.priority };
     },
   );
 
@@ -327,7 +431,7 @@ export const createScopeFn = createServerFn({ method: 'POST' })
  * Toggle a scope's isActive flag.
  */
 export const toggleScopeActiveFn = createServerFn({ method: 'POST' })
-  .inputValidator(
+  .validator(
     z.object({
       principalType: z.nativeEnum(PrincipalType),
       principalId: z.string(),
@@ -368,7 +472,7 @@ export const toggleScopeActiveFn = createServerFn({ method: 'POST' })
  * Delete a scope and all its config overrides.
  */
 export const deleteScopeFn = createServerFn({ method: 'POST' })
-  .inputValidator(
+  .validator(
     z.object({
       principalType: z.nativeEnum(PrincipalType),
       principalId: z.string(),

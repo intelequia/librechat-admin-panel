@@ -187,6 +187,9 @@ export type ReadOnlyReason = 'baseOnly' | 'yamlOnly';
  * - `notApplied`: stored, but the effective configuration still shows the lower layer's value
  * - `yamlMerged`: a key removed in the panel that LibreChat merges back from the layer beneath
  * - `baseScope`: applies to everyone, so it can only be set in Base, not in a profile
+ * - `processServer`: inside an MCP server librechat.yaml runs as a local process (no overrides apply)
+ * - `secretRebinding`: a stored credential LibreChat leaves out, since its destination changed
+ *   without the credential being entered again
  */
 export type SkipReason =
   | ReadOnlyReason
@@ -199,7 +202,13 @@ export type SkipReason =
   | 'yamlMerged'
   | 'baseScope'
   | 'inheritedValue'
-  | 'inheritedMerged';
+  | 'inheritedMerged'
+  | 'processServer'
+  | 'secretRebinding'
+  /** An edit under a value the same save hides: the hide removes it, so it is not sent. */
+  | 'hiddenBySave'
+  /** A write of an entry the target hides whole and the save does not unhide: it would show it again. */
+  | 'hiddenEntry';
 
 /** A record key the admin API cannot store, and the dot-path of the object holding it. */
 export interface UnsafeConfigKey {

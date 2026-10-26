@@ -17,12 +17,13 @@ import { EntryFieldChipsContext } from '@/contexts/EntryFieldChipsContext';
 import { ConfiguredOnlyContext } from '@/contexts/ConfiguredOnlyContext';
 import { fieldMetaFor, fieldVariants, resolveControl } from './kinds';
 import { RevealTargetContext } from '@/contexts/RevealTargetContext';
-import { useFieldState, useLocalize, useValuesScope } from '@/hooks';
+import { useFieldState, useLocalize, useValuesScope, useRecordKeyRemoval } from '@/hooks';
 import { RecordObjectField } from '../fields/RecordObjectField';
 import { RowFilterContext } from '@/contexts/RowFilterContext';
 import { ArrayObjectField } from '../fields/ArrayObjectField';
 import { ShadowBadge, shadowedSourceLabel } from '../values';
 import { BooleanChip, FieldControl } from './FieldControl';
+import { maskedSecretLabel } from '../fields/SecretField';
 import { TriStateField } from '../fields/TriStateField';
 import { fieldDescription, toFieldId } from './paths';
 import { VariantField } from '../fields/VariantField';
@@ -471,6 +472,17 @@ function InlineFieldBody({
   const secretPreview = getSecretPreviewValue(values, field.key);
   /** What clearing goes back to: the value the layer beneath sets (librechat.yaml, or Base in a profile). */
   const revertTo = layerValueBeneath(state);
+  /**
+   * Whether going back to the layer beneath changes anything: a secret the
+   * target stores can't be removed where that layer holds none it can
+   * restate (one it hides), and a value equal to that layer's (a `${VAR}` a
+   * save restated in place of a stored key) stays until the entry's own
+   * revert, since a save that leaves it out keeps it.
+   */
+  const restorable =
+    secretPreview != null && state.isOverride
+      ? revertTo?.value !== undefined
+      : revertTo === undefined || !isConfigValueEqual(fieldValue, revertTo.value);
 
   /**
    * "Default" in an entry: remove the target's own value, so the entry reads
@@ -494,6 +506,8 @@ function InlineFieldBody({
   };
   /** Keys of a record the layer beneath sets: their values can change, but they cannot be removed. */
   const lockedKeys = lowerRecordKeys(state.isOverride ? state.revertTarget?.value : lower?.value);
+  /** …except one by one, by key, where the entry's editor offers it (`keyedTombstones`). */
+  const keyRemoval = useRecordKeyRemoval(dataPath);
   const renderEntryChips = useContext(EntryFieldChipsContext);
   const entryChips = renderEntryChips?.({
     path: dataPath,
@@ -501,6 +515,7 @@ function InlineFieldBody({
     value: fieldValue,
     onChange: (next) => onChange(field.key, next),
     onRevert: clearField,
+    revertable: restorable,
     disabled,
   });
 
@@ -674,7 +689,8 @@ function InlineFieldBody({
   }
   const hasPendingSecret = typeof fieldValue === 'string';
   /** A secret the target stores reads back only as its preview: it is the target's own value, so it can be removed. */
-  const ownsStoredSecret = secretPreview != null && stringValue === '' && state.isOverride;
+  const ownsStoredSecret =
+    secretPreview != null && stringValue === '' && state.isOverride && restorable;
 
   return (
     <InlineRow
@@ -699,9 +715,11 @@ function InlineFieldBody({
           onClear={clearField}
           fieldDefault={ownsStoredSecret ? { ...fieldDefault, hasOwnValue: true } : fieldDefault}
           lockedKeys={lockedKeys}
+          keyRemoval={keyRemoval}
           disabled={disabled}
           required={required}
           secretPreview={secretPreview != null && stringValue === '' ? secretPreview : null}
+          secretMaskLabel={maskedSecretLabel(state, localize)}
           hasPendingEdit={hasPendingSecret}
           onCancelSecret={() => {
             if (hasPendingSecret) onChange(field.key, undefined);

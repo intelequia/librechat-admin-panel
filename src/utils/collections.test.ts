@@ -117,6 +117,16 @@ describe('mergeConfigLayers', () => {
     expect(endpoints[0]).toMatchObject({ baseURL: 'https://x', apiKey: '${MOONSHOT_API_KEY}' });
     expect(merged.list).toEqual([3]);
   });
+
+  it("drops the lower entry's key where the upper one holds its own, as the two travel together", () => {
+    const merged = mergeConfigLayers(
+      yamlEndpoints,
+      [{ name: 'Moonshot', apiKeyPreview: '...1234' }],
+      'endpoints.custom',
+    ) as t.ConfigRecord[];
+    const { apiKey: _yamlKey, ...rest } = yamlEndpoints[0] as t.ConfigRecord;
+    expect(merged[0]).toStrictEqual({ ...rest, apiKeyPreview: '...1234' });
+  });
 });
 
 describe('diffOverride', () => {
@@ -397,6 +407,53 @@ describe('resolveCollectionOps — merge-by-key (endpoints.custom)', () => {
     );
     expect(withKey.issues).toEqual([]);
     expect(withKey.next).toEqual([{ name: 'Renamed EP', baseURL: 'https://s', apiKey: 'sk-new' }]);
+  });
+
+  it('renames an entry with an encrypted key without a new one where the server carries it', () => {
+    const stored = [{ name: 'Secret EP', baseURL: 'https://s', apiKeyPreview: 'sk-abc...1234' }];
+    const value = { name: 'Renamed EP', baseURL: 'https://s' };
+    const carried = resolveCollectionOps({
+      collection: custom,
+      stored,
+      lower: yamlEndpoints,
+      lowerKind: 'yaml',
+      ops: [upsert('Renamed EP', 'Secret EP', value, stored[0])],
+      carriesSecrets: true,
+    });
+    expect(carried.issues).toEqual([]);
+    expect(carried.renames).toEqual([
+      { path: 'endpoints.custom', from: 'Secret EP', to: 'Renamed EP' },
+    ]);
+    expect(carried.next).toEqual([{ name: 'Renamed EP', baseURL: 'https://s' }]);
+    const withKey = resolveCollectionOps({
+      collection: custom,
+      stored,
+      lower: yamlEndpoints,
+      lowerKind: 'yaml',
+      ops: [upsert('Renamed EP', 'Secret EP', { ...value, apiKey: 'sk-new' }, stored[0])],
+      carriesSecrets: true,
+    });
+    expect(withKey.renames).toEqual([]);
+  });
+
+  it('still asks for the key of an entry whose rename swaps names with another', () => {
+    const stored = [
+      { name: 'A', baseURL: 'https://a', apiKeyPreview: 'sk-a...1111' },
+      { name: 'B', baseURL: 'https://b', apiKeyPreview: 'sk-b...2222' },
+    ];
+    const result = resolveCollectionOps({
+      collection: custom,
+      stored,
+      lower: yamlEndpoints,
+      lowerKind: 'yaml',
+      ops: [
+        upsert('B', 'A', { name: 'B', baseURL: 'https://a' }, stored[0]),
+        upsert('A', 'B', { name: 'A', baseURL: 'https://b' }, stored[1]),
+      ],
+      carriesSecrets: true,
+    });
+    expect(result.issues.map((issue) => issue.code)).toContain('SECRET_REQUIRED_FOR_RENAME');
+    expect(result.renames).toEqual([]);
   });
 
   it('strips preview companions so stored secrets are kept by name', () => {

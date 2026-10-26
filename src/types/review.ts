@@ -9,7 +9,7 @@ import type {
 } from './config';
 import type { LocalizeFn, ConfigLayers, ConfigSaveState, ConfigEditsState } from './hooks';
 import type { ImportTab, SaveEntry, TargetMode, SkippedChange } from './config-ui';
-import type { ChangeSummaryItem, ChangeWarning } from './changes';
+import type { ChangeSummaryItem, ChangeWarning, EntryKeyMove, VisibilityEdit } from './changes';
 import type { RevertTarget } from './values';
 import type { ConfigScope } from './scope';
 
@@ -33,6 +33,11 @@ export interface ChangeSummaryInput {
   schemaPaths: ReadonlySet<string>;
   /** Record entries renamed in the panel: new entry path → the saved entry path it came from. */
   renames?: Readonly<Record<string, string>>;
+  /**
+   * Lists the server merges entry by entry (`mergedListPaths`): saving one
+   * never takes over the whole list. Defaults to the custom endpoints.
+   */
+  mergedLists?: ReadonlySet<string>;
 }
 
 /** Where a collection entry sits: its collection, data path and identity (WS7). */
@@ -40,6 +45,17 @@ export interface ChangeEntryRef {
   collectionPath: string;
   entryPath: string;
   identity?: string;
+}
+
+/**
+ * Where a stored secret a save removes is, as review rows name it: inside a
+ * collection entry (by identity, so a renamed or moved entry still matches)
+ * at `path` within it, else at `path`; `display` is its path on the page.
+ */
+export interface SecretLocation {
+  entry?: ChangeEntryRef;
+  path: string;
+  display: string;
 }
 
 /** The layers below the edit target, for `lowerValue` (WS7). */
@@ -88,7 +104,7 @@ export interface ReviewRow {
   label: string;
   /** Collection noun for entry-level changes ("endpoint", "MCP server"). */
   noun?: string;
-  /** Leaves of an added entry, listed under it. */
+  /** Leaves of an added entry, or what a change deletes with it (`dropped`), listed under it. */
   details?: ReviewRow[];
   issues?: ReviewIssue[];
   /** Option labels of an enum setting by value ("remaining_tokens" → "Remaining tokens"). */
@@ -180,20 +196,27 @@ export interface ChangeReviewOptions {
     | 'isDirty'
     | 'saveError'
     | 'handleFieldChange'
-    | 'handleResetField'
     | 'handleDiscardField'
     | 'handleDiscard'
     | 'visibilityEdits'
     | 'renameEdits'
+    | 'restateEdits'
     | 'handleHideField'
     | 'handleUnhideField'
     | 'handleRenameEntry'
+    | 'handleRestateCredential'
+    | 'snapshot'
+    | 'editSessionId'
+    | 'handleRestoreEdits'
   >;
   save: Pick<
     ConfigSaveState,
     | 'savePlan'
     | 'fieldErrors'
     | 'changes'
+    | 'warnings'
+    | 'removedSecrets'
+    | 'keyMoves'
     | 'saving'
     | 'sessionExpired'
     | 'termsUrl'
@@ -201,9 +224,17 @@ export interface ChangeReviewOptions {
     | 'openReview'
     | 'cancelReview'
     | 'handleConfirmSave'
+    | 'finishWithoutWrites'
+    | 'editRevision'
+    | 'holdRevision'
+    | 'conflict'
+    | 'reloadLatest'
+    | 'saveOverLatest'
   >;
   /** Switches the page to a tab (the review's "Go to field"). */
   onTabChange: (tabId: string) => void;
+  /** Every profile, in the order they apply: a rename or removal in Base names those it leaves overrides behind in. */
+  profiles?: readonly ConfigScope[];
 }
 
 /** The change review and unsaved-changes bar state (WS7). */
@@ -215,6 +246,15 @@ export interface ChangeReviewState {
   sessionExpired: boolean;
   /** The last save was refused until the admin accepts LibreChat's terms: where to accept them, else `null`. */
   termsUrl: string | null;
+  /**
+   * The last save found the target saved elsewhere meanwhile, and wrote
+   * nothing: until Reload or Merge, or the review is closed, Save is refused.
+   */
+  conflict: boolean;
+  /** After a conflict: drops the edits (with Undo) and shows the target as it is stored now. */
+  reloadLatest: () => void;
+  /** After a conflict: saves the edits over the target as it is stored now. */
+  mergeLatest: () => Promise<void>;
   /** Error from the last failed save, as labelled issues. */
   saveIssues: ReviewIssue[];
   /** Title naming the target: "Save 2 changes to Role: USER?". */
@@ -261,22 +301,107 @@ export interface ReviewRowViewProps {
   compact?: boolean;
 }
 
+/** What the review names the profiles that override Base's entries by name against (`overrideNotes`). */
+export interface OverrideNoteOptions {
+  profiles: readonly ConfigScope[];
+  /** The entries the save keeps while moving where profiles' own keys there go (`findEntryKeyMoves`). */
+  keyMoves: readonly EntryKeyMove[];
+  /** LibreChat sends a profile's own key to whatever entry holds the name (no `secretRebinding`). */
+  sendsKeys: boolean;
+  /** The configuration before the save, where a name already in use is no leftover. */
+  before: ConfigValue;
+  /** Profiles hide custom endpoints, and remove values inside them, by key (`keyedTombstones`). */
+  keyedTombstones?: boolean;
+  /**
+   * The lists LibreChat merges entry by entry (`mergedListPaths`), whose
+   * entries profiles override by name like MCP servers. Defaults to the
+   * custom endpoints.
+   */
+  mergedLists?: ReadonlySet<string>;
+}
+
+/** The layers a pending hide or unhide by key (`endpoints.custom["Name"]…`) is described from in the review. */
+export interface KeyedVisibilityLayers {
+  /** The layer beneath the target: librechat.yaml for Base, Base for a profile. */
+  lower: ConfigValue;
+  /** The target's own stored overrides. */
+  own: ConfigValue;
+  /** The saved config the page shows. */
+  baseline: ConfigValue;
+  isScope: boolean;
+  /** The target's tombstones as stored. */
+  tombstones: Iterable<string>;
+  /** The pending hides and unhides. */
+  visibility: Readonly<Record<string, VisibilityEdit>>;
+  /** LibreChat applies keyed tombstones: a hide or unhide inside an entry deletes the target's own value there. */
+  keyedTombstones: boolean;
+}
+
+/** What a save's rows in Base are checked against for those profiles: the options, and the entries rows write. */
+export interface OverrideNoteContext extends OverrideNoteOptions {
+  /** The entries a row writes under their name once the save is applied (`collection\u0000name`). */
+  written: ReadonlySet<string>;
+}
+
+/** Props of a part of a review row that reads one change. */
+export type ChangeItemProps = Pick<ReviewRow, 'item'>;
+
+/** `ChangeItemProps` worded for the target: Base, or a profile (`isScope`). */
+export interface ScopedChangeItemProps extends ChangeItemProps {
+  isScope: boolean;
+}
+
+/** Props of a detail under a review row: a leaf of an added entry, or a part the change deletes with it. */
+export interface ReviewDetailValueProps {
+  detail: ReviewRow;
+}
+
 /** Why an imported key is left out (WS7). */
-export type ImportSkipReason = SkippedChange['reason'] | 'unsafeKey' | 'processMcp';
+export type ImportSkipReason =
+  | SkippedChange['reason']
+  | 'unsafeKey'
+  | 'reservedKey'
+  | 'dottedKey'
+  | 'dottedName'
+  | 'processMcp';
+
+/**
+ * An imported secret an import never writes (WS7): the value is the mask
+ * LibreChat shows for a hidden key (`masked`), or the key it would replace is
+ * hidden from the panel, a librechat.yaml literal (`hidden`).
+ */
+export interface WithheldSecret {
+  path: string;
+  reason: 'hidden' | 'masked';
+}
+
+/**
+ * What an import leaves out of the merged lists it writes: the secrets it
+ * never writes, and the paths of the imported entries the target hides
+ * whole (`keyedTombstones`), since writing one would show it again.
+ */
+export interface ImportLeftOut {
+  withheld: WithheldSecret[];
+  hidden: string[];
+}
 
 /** An imported leaf that will not be written, and why (WS7). */
 export interface ImportSkippedKey {
   fieldPath: string;
   reason: ImportSkipReason;
-  /** For `unsafeKey`: the key, held by the object at `fieldPath`. */
+  /** For `unsafeKey`, `reservedKey`, `dottedKey` and `dottedName`: the key, held by the object at `fieldPath`. */
   key?: string;
 }
 
 /** Leaves of an imported YAML, and the keys the admin API can't store (WS7). */
 export interface ImportLeaves {
   leaves: FlatConfigMap;
-  /** Keys containing `.` or starting with `$`, with the path of the object holding them. */
+  /** Keys the admin API can't store (`isUnsafeConfigKey`), with the path of the object holding them. */
   unsafe: UnsafeConfigKey[];
+  /** With `dottedKeys`: dotted keys where the schema expects a setting name, not a free key. */
+  dotted: UnsafeConfigKey[];
+  /** With `dottedKeys`: dotted names in a record of setting groups (an MCP server), written field by field. */
+  dottedNames: UnsafeConfigKey[];
 }
 
 /** Imported leaves split into what can be written and what is left out (WS7). */
@@ -305,6 +430,8 @@ export interface ImportPreviewRow {
   unknown: boolean;
   /** Writing it replaces a whole list the target inherits (model specs). */
   replacesList?: boolean;
+  /** What the endpoints the target hides take from the imported value for its members, worded (`keyedTombstones`). */
+  hiddenNotes?: string[];
 }
 
 /** Imported leaves of one tab section (WS7). */

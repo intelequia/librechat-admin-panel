@@ -21,7 +21,7 @@ const EMPTY_SCOPE_CONFIG: t.ResolvedConfigData = {
  * vary per user and are not part of a profile's inheritance (EV-5).
  */
 export const getResolvedConfigFn = createServerFn({ method: 'GET' })
-  .inputValidator(
+  .validator(
     z.object({
       principalType: z.nativeEnum(PrincipalType),
       principalId: z.string(),
@@ -48,6 +48,12 @@ export const getResolvedConfigFn = createServerFn({ method: 'GET' })
       const resolvedConfig: t.FlatConfigMap = {};
       for (const path of changedPaths) resolvedConfig[path] = getValueAtPath(overrides, path);
 
-      return { resolvedConfig, changedPaths, overrides, tombstones: config.tombstones ?? [] };
+      return {
+        resolvedConfig,
+        changedPaths,
+        overrides,
+        tombstones: config.tombstones ?? [],
+        ...(typeof config.revision === 'string' && { revision: config.revision }),
+      };
     },
   );

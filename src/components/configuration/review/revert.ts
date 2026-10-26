@@ -1,10 +1,15 @@
 import type * as t from '@/types';
-import { getValueAtPath, flattenObject, isConfigRecord, deepSerializeKVPairs } from '@/utils';
+import {
+  flattenObject,
+  getValueAtPath,
+  isConfigRecord,
+  isSecretPreviewPath,
+  deepSerializeKVPairs,
+} from '@/utils';
 import { isConfigValueEqual, normalizeForSave } from '../edits';
-import { identityKeyFor, isSecretPath } from './diff';
+import { identityKeyFor } from './diff';
 
 const INDEX_SEGMENT_RE = /^\d+$/;
-const PREVIEW_SUFFIX = 'Preview';
 
 function childOf(value: t.ConfigValue, segment: string): t.ConfigValue {
   if (Array.isArray(value))
@@ -14,6 +19,21 @@ function childOf(value: t.ConfigValue, segment: string): t.ConfigValue {
 
 function relativeSegments(path: string, base: string): string[] {
   return path === base ? [] : path.slice(base.length + 1).split('.');
+}
+
+/**
+ * The segments of a row's path below `base` (a prefix of it). A dotted record
+ * key (`us.anthropic.claude-sonnet-4-6`) stays one segment: the row carries
+ * its path's `segments`, since splitting the path would break the key apart.
+ */
+function segmentsBelow(item: t.ChangeSummaryItem, base: string): string[] {
+  if (!item.segments) return relativeSegments(item.path, base);
+  let prefix = '';
+  for (let i = 0; i < item.segments.length; i++) {
+    prefix = i === 0 ? item.segments[i] : `${prefix}.${item.segments[i]}`;
+    if (prefix === base) return item.segments.slice(i + 1);
+  }
+  return relativeSegments(item.path, base);
 }
 
 /**
@@ -97,7 +117,7 @@ function revertListEntry(
     next[index] = revertAt(pending[index], previous, [key]);
     return next;
   }
-  next[index] = revertAt(pending[index], previous, relativeSegments(item.path, entryPath));
+  next[index] = revertAt(pending[index], previous, segmentsBelow(item, entryPath));
   return next;
 }
 
@@ -113,7 +133,7 @@ function revertWithin(
   item: t.ChangeSummaryItem,
 ): t.ConfigValue {
   const { collectionPath } = item;
-  const byPath = () => revertAt(pending, baseline, relativeSegments(item.path, sourcePath));
+  const byPath = () => revertAt(pending, baseline, segmentsBelow(item, sourcePath));
   if (
     collectionPath == null ||
     (collectionPath !== sourcePath && !collectionPath.startsWith(`${sourcePath}.`))
@@ -160,15 +180,10 @@ function pendingUnder(editedValues: t.FlatConfigMap, path: string): string[] {
   return Object.keys(editedValues).filter((key) => key === path || key.startsWith(`${path}.`));
 }
 
-/** The masked preview the admin API returns for a stored secret (`oauth.client_secretPreview`). */
-function isSecretPreview(leaf: string): boolean {
-  return leaf.endsWith(PREVIEW_SUFFIX) && isSecretPath(leaf.slice(0, -PREVIEW_SUFFIX.length));
-}
-
 /** Whether a removed value is only what a rename never carries: stored secrets' previews. */
 function isPreviewOnly(value: t.ConfigValue, path: string): boolean {
-  if (!isConfigRecord(value)) return isSecretPreview(path);
-  return Object.keys(flattenObject(value, path)).every(isSecretPreview);
+  if (!isConfigRecord(value)) return isSecretPreviewPath(path);
+  return Object.keys(flattenObject(value, path)).every(isSecretPreviewPath);
 }
 
 /**
@@ -195,7 +210,7 @@ function renamedChanges(
     const nowLeaves = flattenObject(now, key);
     return [...new Set([...Object.keys(wasLeaves), ...Object.keys(nowLeaves)])]
       .filter((leaf) => !isConfigValueEqual(wasLeaves[leaf], nowLeaves[leaf]))
-      .filter((leaf) => nowLeaves[leaf] !== undefined || !isSecretPreview(leaf))
+      .filter((leaf) => nowLeaves[leaf] !== undefined || !isSecretPreviewPath(leaf))
       .map((leaf) => ({ path: `${previousPath}.${leaf}`, value: nowLeaves[leaf] }));
   });
 }
@@ -266,8 +281,9 @@ export function planRevert(
     item.previousIdentity != null &&
     item.entryPath != null &&
     !INDEX_SEGMENT_RE.test(item.entryPath.slice(item.entryPath.lastIndexOf('.') + 1));
+  /** A secret entered for it goes again: its `before` is the masked preview, never a value to write. */
   if (isRenamedField && item.path in editedValues) {
-    return item.before === undefined
+    return item.before === undefined || item.secret
       ? { op: 'discard', paths: [item.path] }
       : { op: 'set', path: item.path, value: item.before };
   }

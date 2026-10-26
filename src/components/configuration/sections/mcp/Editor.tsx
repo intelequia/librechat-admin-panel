@@ -8,12 +8,20 @@ import {
   isHttpTransport,
   transportLabelKey,
 } from './transport';
-import { isConfigRecord, isConfigValueEqual, asConfigRecord, hasConfigValue } from '@/utils';
+import {
+  isConfigRecord,
+  asConfigRecord,
+  hasConfigValue,
+  isConfigValueEqual,
+  toSecretPreviewKey,
+} from '@/utils';
 import { renderCollectionEntryFields, renderInlineField, toFieldId } from '../../renderer';
 import { RecordObjectField } from '../../fields/RecordObjectField';
+import { SecretNotSentNotice } from '../../fields/SecretField';
 import { UnknownSettings } from '../../UnknownSettings';
 import { InstructionsField } from './Instructions';
 import { TransportSelect } from './Transport';
+import { labelForPath } from '../../meta';
 import { McpAuthMethod } from './Method';
 import { McpFieldGroup } from './Group';
 import { useLocalize } from '@/hooks';
@@ -56,6 +64,24 @@ const GROUPED: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * A secret's parent object (`apiKey`) with the masked preview of the secret
+ * the server carries to it from the saved server it comes from, while this
+ * one leaves the secret unset: the row shows the key that moves along.
+ */
+function withCarriedPreview(
+  own: t.ConfigRecord,
+  carried: t.ConfigValue,
+  key: string,
+): t.ConfigRecord {
+  const previewKey = toSecretPreviewKey(key);
+  const preview = asConfigRecord(carried)[previewKey];
+  if (typeof preview !== 'string' || own[key] !== undefined || own[previewKey] !== undefined) {
+    return own;
+  }
+  return { ...own, [previewKey]: preview };
+}
+
+/**
  * The purpose-built editor of one MCP server (MCP-1…MCP-8): Connection (the
  * transport and its fields only), Authentication (one method), Display,
  * Behavior, User variables and Advanced. Fields the transport doesn't read
@@ -77,6 +103,9 @@ export function McpServerEditor({
   quiet,
   owned,
   ownKeys,
+  movedCredentials,
+  carriedFrom,
+  isPendingWhole,
   editSessionId,
 }: t.McpEditorProps) {
   const localize = useLocalize();
@@ -146,17 +175,27 @@ export function McpServerEditor({
     if (isNestedObject(field)) {
       return renderObject(field, asConfigRecord(entry[parent]), `${entryPath}.${parent}`, change);
     }
+    const moved = movedCredentials?.get(`${parent}.${key}`);
+    const notSent = moved ? (
+      <SecretNotSentNotice
+        credential={moved}
+        fields={moved.moved
+          .map((path) => labelForPath(`mcpServers.{}.${path}`, localize))
+          .join(', ')}
+      />
+    ) : undefined;
     return (
       <McpField
         key={`${parent}.${key}`}
         field={field}
         entryPath={`${entryPath}.${parent}`}
-        entry={asConfigRecord(entry[parent])}
+        entry={withCarriedPreview(asConfigRecord(entry[parent]), carriedFrom?.[parent], key)}
         onChange={change}
         onDiscard={onDiscard}
         disabled={disabled}
         quiet={quiet}
         owned={owned}
+        extra={notSent}
         {...options}
       />
     );
@@ -293,6 +332,7 @@ export function McpServerEditor({
             onChange={onChange}
             disabled={disabled}
             editSessionId={editSessionId}
+            wholePending={isPendingWhole?.('customUserVars')}
           />
         </McpFieldGroup>
       )}
@@ -365,10 +405,20 @@ function UrlHint({ transport }: { transport: t.McpTransport }) {
   return <span className="settings-hint">{localize(key)}</span>;
 }
 
+/** Keys added, changed or removed between two records. */
+function changedKeys(current: t.ConfigRecord, next: t.ConfigRecord): string[] {
+  const keys = new Set([...Object.keys(next), ...Object.keys(current)]);
+  return [...keys].filter((key) => !isConfigValueEqual(current[key], next[key]));
+}
+
 /**
  * The values each user enters (customUserVars), as cards keyed by variable
  * name. Only the variables that change are written, so a server's override
  * stays sparse; variables the layer beneath defines can't be removed (D3).
+ * A change to a variable whose name has a dot (`dottedKeys`) writes the
+ * variables as one record, since a dot-path can't name that variable; so
+ * does every change while such a write is pending (`wholePending`), which a
+ * write of one variable would replace.
  */
 function UserVariables({
   field,
@@ -378,6 +428,7 @@ function UserVariables({
   onChange,
   disabled,
   editSessionId,
+  wholePending,
 }: {
   field: t.SchemaField;
   entryPath: string;
@@ -386,16 +437,17 @@ function UserVariables({
   onChange: (leaf: string, value: t.ConfigValue) => void;
   disabled?: boolean;
   editSessionId?: number;
+  wholePending?: boolean;
 }) {
   const current = asConfigRecord(value);
   const write = (next: t.ConfigValue) => {
     const nextRecord = asConfigRecord(next);
-    for (const [key, item] of Object.entries(nextRecord)) {
-      if (!isConfigValueEqual(current[key], item)) onChange(`${field.key}.${key}`, item);
+    const changed = changedKeys(current, nextRecord);
+    if (wholePending || changed.some((key) => key.includes('.'))) {
+      onChange(field.key, Object.keys(nextRecord).length > 0 ? nextRecord : undefined);
+      return;
     }
-    for (const key of Object.keys(current)) {
-      if (!Object.hasOwn(nextRecord, key)) onChange(`${field.key}.${key}`, undefined);
-    }
+    for (const key of changed) onChange(`${field.key}.${key}`, nextRecord[key]);
   };
   return (
     <div className="py-2">

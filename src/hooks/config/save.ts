@@ -5,13 +5,35 @@ import {
   errorText,
   notifyInfo,
   notifyError,
+  uniqueSkipped,
   notifyWarning,
   notifySuccess,
   getValueAtPath,
   termsRefusalUrl,
+  toBatchOps,
+  carryChanges,
+  asConfigRecord,
+  carriedEntries,
+  describeIssueCode,
+  restateChanges,
+  isRestateWarning,
+  findEntryKeyMoves,
+  findRemovedSecrets,
+  countSectionChanges,
+  findOversizedSections,
+  usesChangeBatch,
   planConfigChanges,
   mergedBackChanges,
+  toRevisionPrecondition,
 } from '@/utils';
+import {
+  UNSAFE_KEY_CODES,
+  TERMS_NOT_ACCEPTED_CODE,
+  TERMS_NOT_ACCEPTED_ISSUE,
+  RESOLVED_READ_QUERY_KEYS,
+  MCP_API_KEY_MISSING_CODE,
+  MCP_SECRET_NOT_CARRIED_CODE,
+} from '@/constants';
 import {
   ADMIN_API_KEY_FIELD,
   validateMcpCrossField,
@@ -20,11 +42,10 @@ import { buildConfigChanges, normalizeEditValue } from '@/components/configurati
 import { specListIssues } from '@/components/configuration/sections/specs/validation';
 import { isResetSent, summarizeChanges } from '@/components/configuration/summary';
 import { describeSkippedChanges } from '@/components/configuration/review/group';
-import { TERMS_NOT_ACCEPTED_ISSUE, TERMS_NOT_ACCEPTED_CODE } from '@/constants';
+import { useConfigContract, useConfigWriteRules } from './contract';
 import { applyConfigChangesFn, resetBaseConfigFn } from '@/server';
 import { describeIssues } from '@/components/configuration/issues';
 import { hasPathOverlap } from '@/components/configuration/counts';
-import { labelForPath } from '@/components/configuration/meta';
 import { useLocalize } from '../useLocalize';
 
 function toTargetRef(target: t.WriteTarget): t.WriteTargetRef {
@@ -33,10 +54,38 @@ function toTargetRef(target: t.WriteTarget): t.WriteTargetRef {
   return { type: 'scope', scope: { principalType, principalId } };
 }
 
+/** A problem `validateMcpCrossField` finds, as a pre-flight issue on the field it names. */
+function toMcpIssue({ entryKey, missingField, renamedFrom }: t.McpCrossFieldError): t.ConfigIssue {
+  const path = `mcpServers.${entryKey}.${missingField}`;
+  if (renamedFrom !== undefined) {
+    const params = { from: renamedFrom };
+    const code = MCP_SECRET_NOT_CARRIED_CODE;
+    return { path, code, params, message: describeIssueCode(code, params, '') };
+  }
+  const code = missingField === ADMIN_API_KEY_FIELD ? MCP_API_KEY_MISSING_CODE : 'required';
+  return { path, code, message: describeIssueCode(code, undefined, '') };
+}
+
 function hasWrites(plan: t.WritePlan): boolean {
   return (
     plan.sets.length + plan.resets.length + plan.tombstones.length + plan.untombstones.length > 0
   );
+}
+
+/**
+ * The revision the pending edits were made against: the target's loaded
+ * revision when the first of them was made, held while any is pending. A
+ * re-read meanwhile (the review opening, a window-focus refetch) does not
+ * move it, so a save over a version someone else saved since is a conflict
+ * rather than a silent overwrite. Once the edits are saved or dropped it
+ * follows the loaded revision again; `hold` puts back the revision of edits
+ * restored with them (Discard's Undo).
+ */
+function useEditRevision(loaded: t.Revision, pending: boolean): t.HeldRevision {
+  const [held, setHeld] = useState({ pending, revision: loaded });
+  if (held.pending !== pending) setHeld({ pending, revision: loaded });
+  const hold = useCallback((revision: t.Revision) => setHeld({ pending: true, revision }), []);
+  return { revision: pending && held.pending ? held.revision : loaded, hold };
 }
 
 /** The admin session ended (signed out elsewhere or expired): the save never reached LibreChat. */
@@ -51,17 +100,6 @@ function termsUrlOf(result: t.ApplyConfigChangesResult): string | null {
   const issue = result.failed.find(({ code }) => code === TERMS_NOT_ACCEPTED_ISSUE);
   if (!issue) return null;
   return typeof issue.params?.url === 'string' ? issue.params.url : '';
-}
-
-/** Skipped changes without repeats (the client and the server can report the same path). */
-function uniqueSkipped(skipped: t.SkippedChange[]): t.SkippedChange[] {
-  const seen = new Set<string>();
-  return skipped.filter(({ fieldPath, reason }) => {
-    const key = `${fieldPath}|${reason}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
 }
 
 /**
@@ -80,6 +118,8 @@ export function useConfigSave({
 }: t.ConfigSaveOptions): t.ConfigSaveState {
   const localize = useLocalize();
   const queryClient = useQueryClient();
+  const { features, limits } = useConfigContract();
+  const writeRules = useConfigWriteRules();
   const {
     configValues,
     dbOverrides,
@@ -89,6 +129,7 @@ export function useConfigSave({
     overridePaths,
     valueLayers,
     baseActiveConfigValues,
+    targetRevision,
   } = layers;
   const {
     editedValues,
@@ -99,6 +140,9 @@ export function useConfigSave({
     editBaselines,
     visibilityEdits,
     renameEdits,
+    copyEdits,
+    restateEdits,
+    handleRestateCredential,
   } = edits;
   const isEditingScope = editingScope !== undefined;
 
@@ -107,13 +151,29 @@ export function useConfigSave({
   const [serverIssues, setServerIssues] = useState<t.ConfigIssue[]>([]);
   const [sessionExpired, setSessionExpired] = useState(false);
   const [termsUrl, setTermsUrl] = useState<string | null>(null);
+  const [conflict, setConflict] = useState(false);
 
   useEffect(() => setServerIssues([]), [editedValues, visibilityEdits]);
+
+  const hasPendingEdits = [editedValues, visibilityEdits, restateEdits].some(
+    (pending) => Object.keys(pending).length > 0,
+  );
+  const { revision: editRevision, hold: holdRevision } = useEditRevision(
+    targetRevision,
+    hasPendingEdits,
+  );
+
+  /** The revision the edits are saved against (`changesBatch`): see `useEditRevision`. */
+  const expectedRevision = useMemo(
+    () => (usesChangeBatch(features) ? toRevisionPrecondition(editRevision) : undefined),
+    [features, editRevision],
+  );
 
   const clearEdits = useCallback(() => {
     resetEdits();
     setConfirmSaveOpen(false);
     setSaving(false);
+    setConflict(false);
     setSaveError(null);
   }, [resetEdits, setSaveError]);
 
@@ -144,28 +204,30 @@ export function useConfigSave({
     [localize, describeSkipped],
   );
 
+  /** The target's own reads, and the server-resolved ones (catalogs, env status, previews) any save can change. */
   const invalidateTarget = useCallback(
     (target: t.WriteTarget) => {
-      if (target.type === 'base') {
-        return queryClient.invalidateQueries({ queryKey: ['baseConfig'] });
-      }
-      return Promise.all([
-        queryClient.invalidateQueries({ queryKey: ['resolvedConfig'] }),
-        queryClient.invalidateQueries({ queryKey: ['availableScopes'] }),
-      ]);
+      const keys: ReadonlyArray<readonly string[]> =
+        target.type === 'base'
+          ? [['baseConfig'], ...RESOLVED_READ_QUERY_KEYS]
+          : [['resolvedConfig'], ['availableScopes'], ...RESOLVED_READ_QUERY_KEYS];
+      return Promise.all(keys.map((queryKey) => queryClient.invalidateQueries({ queryKey })));
     },
     [queryClient],
   );
 
   /**
    * Applies ops through the server's validated apply; queries are refetched
-   * whatever the outcome. A call that fails outright (an ended session) is
-   * reported at once: the refetch, which retries, runs in the background.
+   * whatever the outcome, so after a conflict the page shows what is stored
+   * now. A call that fails outright (an ended session) is reported at once:
+   * the refetch, which retries, runs in the background.
    */
   const applyChanges = useCallback(
-    async (target: t.WriteTarget, ops: t.ConfigChange[]) => {
+    async (target: t.WriteTarget, ops: t.ConfigChange[], revision?: string) => {
       try {
-        const result = await applyConfigChangesFn({ data: { target: toTargetRef(target), ops } });
+        const result = await applyConfigChangesFn({
+          data: { target: toTargetRef(target), ops, expectedRevision: revision },
+        });
         await invalidateTarget(target);
         return result;
       } catch (err) {
@@ -183,6 +245,7 @@ export function useConfigSave({
       const { summaries } = describeIssues(blocking, collections, localize);
       const titleKey = (() => {
         if (result.issues.length > 0) return 'com_config_validation_failed';
+        if (result.partiallyWritten) return 'com_config_apply_partial';
         return result.compensated === false
           ? 'com_config_apply_rollback_incomplete'
           : 'com_config_apply_failed';
@@ -212,7 +275,7 @@ export function useConfigSave({
       if (result.issues.length > 0 || result.failed.length > 0) {
         throw new Error(describeFailure(result, []));
       }
-      return result.skipped;
+      return { skipped: result.skipped, reported: result.reported };
     },
     [applyChanges, describeFailure],
   );
@@ -226,6 +289,7 @@ export function useConfigSave({
       root: baseActiveConfigValues,
       collections: collectionEdits,
       visibility: visibilityEdits,
+      writeRules,
     }),
     [
       schemaTree,
@@ -234,6 +298,7 @@ export function useConfigSave({
       isEditingScope,
       collectionEdits,
       visibilityEdits,
+      writeRules,
     ],
   );
 
@@ -242,23 +307,120 @@ export function useConfigSave({
     [touchedPaths, editedValues, schemaPathSet, changeContext],
   );
 
-  /** The target's stored overrides and the layer beneath, as loaded (the server re-reads them). */
+  /** The target's stored overrides and tombstones and the layer beneath, as loaded (the server re-reads them). */
   const snapshot = useMemo<t.WriteSnapshot>(() => {
     if (isEditingScope) {
       return {
         stored: valueLayers?.scope?.overrides ?? {},
+        tombstones: [...(valueLayers?.scope?.tombstones ?? [])],
         lower: configValues ?? {},
         lowerKind: 'inherited',
       };
     }
-    return { stored: dbOverrides ?? {}, lower: yamlConfig ?? {}, lowerKind: 'yaml' };
+    return {
+      stored: dbOverrides ?? {},
+      tombstones: [...(valueLayers?.baseTombstones ?? [])],
+      lower: yamlConfig ?? {},
+      lowerKind: 'yaml',
+    };
   }, [isEditingScope, valueLayers, configValues, dbOverrides, yamlConfig]);
 
-  const plan = useMemo(() => planConfigChanges(changeSet.ops, snapshot), [changeSet, snapshot]);
+  /**
+   * The edits as ops, with what renamed and duplicated MCP servers carry of
+   * their stored secrets, and the inherited credentials the edits restate.
+   */
+  const ops = useMemo(
+    () => [
+      ...changeSet.ops,
+      ...carryChanges(renameEdits, copyEdits),
+      ...restateChanges(restateEdits),
+    ],
+    [changeSet.ops, renameEdits, copyEdits, restateEdits],
+  );
+
+  const plan = useMemo(
+    () => planConfigChanges(ops, snapshot, features, writeRules, limits),
+    [ops, snapshot, features, writeRules, limits],
+  );
+
+  /**
+   * A restate of a credential the edits no longer move (its destination set
+   * back) changes nothing: it is dropped, so it leaves no pending change.
+   */
+  useEffect(() => {
+    for (const ref of Object.values(restateEdits)) {
+      if (!plan.warnings.some((warning) => isRestateWarning(warning, ref))) {
+        handleRestateCredential(ref, false);
+      }
+    }
+  }, [plan, restateEdits, handleRestateCredential]);
+
+  /**
+   * Per-leaf saves can leave an MCP server without a field its transport
+   * needs, or without a key it uses; the merged server (scope-resolved in a
+   * profile, stored keys kept as LibreChat keeps them) is checked before
+   * anything is sent, so the review and the card name the problem first.
+   */
+  const mcpIssues = useMemo((): t.ConfigIssue[] => {
+    const { touched, saves, resets } = changeSet.payload;
+    const savedValues = new Map(saves.map((e) => [e.fieldPath, e.value]));
+    const resetSet = new Set(resets);
+    const mcpEdits: Array<[string, t.ConfigValue]> = touched
+      .filter((p) => p.startsWith('mcpServers.') && (savedValues.has(p) || resetSet.has(p)))
+      .map((p) => [p, savedValues.get(p)]);
+    if (mcpEdits.length === 0) return [];
+    /** A reset reveals the next-lower layer: the base config in a profile, librechat.yaml in base. */
+    const fallback = asConfigRecord(isEditingScope ? configValues?.mcpServers : yamlMcpServers);
+    return validateMcpCrossField(
+      asConfigRecord(baseActiveConfigValues?.mcpServers),
+      mcpEdits,
+      fallback,
+      renameEdits,
+      carriedEntries(plan, 'mcpServers'),
+    ).map(toMcpIssue);
+  }, [
+    changeSet.payload,
+    isEditingScope,
+    configValues,
+    yamlMcpServers,
+    baseActiveConfigValues,
+    renameEdits,
+    plan,
+  ]);
+
+  /** A section with more changes than one batch takes is refused whole: said before Save (`changesBatch`). */
+  const oversizedIssues = useMemo(
+    () =>
+      usesChangeBatch(features)
+        ? findOversizedSections(countSectionChanges(toBatchOps(plan)), limits.maxChangeOps)
+        : [],
+    [features, plan, limits.maxChangeOps],
+  );
+
+  /** The stored secrets the save takes away, whatever change removes them: the review names each. */
+  const removedSecrets = useMemo(
+    () => findRemovedSecrets(snapshot.stored, plan),
+    [snapshot.stored, plan],
+  );
+
+  /** In Base, the entries the save keeps while moving where profiles' own keys there go: the review names them. */
+  const keyMoves = useMemo(
+    () =>
+      isEditingScope
+        ? []
+        : findEntryKeyMoves({ ...snapshot, storedAfter: plan.storedAfter }, features),
+    [isEditingScope, snapshot, plan.storedAfter, features],
+  );
 
   const clientIssues = useMemo(
-    () => [...changeSet.issues, ...plan.issues, ...specListIssues(changeSet)],
-    [changeSet, plan.issues],
+    () => [
+      ...changeSet.issues,
+      ...plan.issues,
+      ...mcpIssues,
+      ...oversizedIssues,
+      ...specListIssues(changeSet),
+    ],
+    [changeSet, plan.issues, mcpIssues, oversizedIssues],
   );
 
   const issues = useMemo(() => [...clientIssues, ...serverIssues], [clientIssues, serverIssues]);
@@ -302,7 +464,7 @@ export function useConfigSave({
   const unsafeKeys = useMemo(
     () =>
       plan.issues
-        .filter((issue) => issue.code === 'UNSAFE_KEY')
+        .filter((issue) => issue.code != null && UNSAFE_KEY_CODES.has(issue.code))
         .map((issue) => ({ path: issue.path, key: String(issue.params?.key ?? '') })),
     [plan.issues],
   );
@@ -343,136 +505,135 @@ export function useConfigSave({
     [isEditingScope, editingScope],
   );
 
-  /** Per-leaf saves can land an MCP entry in a transport state whose required siblings are missing; check the merged entry (scope-resolved in a profile) before anything is sent. */
-  const findMcpError = useCallback((): string | null => {
-    const { touched, saves, resets } = changeSet.payload;
-    const savedValues = new Map(saves.map((e) => [e.fieldPath, e.value]));
-    const resetSet = new Set(resets);
-    const mcpEdits: Array<[string, t.ConfigValue]> = touched
-      .filter((p) => p.startsWith('mcpServers.') && (savedValues.has(p) || resetSet.has(p)))
-      .map((p) => [p, savedValues.get(p)]);
-    if (mcpEdits.length === 0) return null;
-    const asRecord = (value: t.ConfigValue) =>
-      value && typeof value === 'object' && !Array.isArray(value)
-        ? (value as Record<string, t.ConfigValue>)
-        : undefined;
-    /** A reset reveals the next-lower layer: the base config in a profile, librechat.yaml in base. */
-    const fallback = asRecord(isEditingScope ? configValues?.mcpServers : yamlMcpServers);
-    const mcpErrors = validateMcpCrossField(
-      asRecord(baseActiveConfigValues?.mcpServers) ?? {},
-      mcpEdits,
-      fallback,
-      renameEdits,
-    );
-    if (mcpErrors.length === 0) return null;
-    const { entryKey, missingField, renamedFrom } = mcpErrors[0];
-    if (renamedFrom !== undefined) {
-      return localize('com_config_mcp_missing_secret_for_rename', {
-        entry: entryKey,
-        from: renamedFrom,
-        field: labelForPath(`mcpServers.{}.${missingField}`, localize),
-      });
+  /** Ends a save that writes nothing: the edits are dropped, and what is left out is listed. */
+  const finishWithoutWrites = useCallback(() => {
+    clearEdits();
+    if (savePlan.skipped.length > 0) {
+      announceWrite(savePlan.skipped, 0, localize('com_config_saved'));
+      return;
     }
-    if (missingField === ADMIN_API_KEY_FIELD) {
-      return localize('com_config_mcp_missing_api_key', { entry: entryKey });
-    }
-    return localize('com_config_mcp_invalid_after_edit', { entry: entryKey, field: missingField });
-  }, [
-    changeSet.payload,
-    isEditingScope,
-    configValues,
-    yamlMcpServers,
-    baseActiveConfigValues,
-    renameEdits,
-    localize,
-  ]);
+    notifyInfo(localize('com_config_nothing_to_save'));
+  }, [clearEdits, savePlan.skipped, announceWrite, localize]);
 
+  /**
+   * Saves the pending edits to the edit target, against `revision` (see
+   * `ApplyConfigChangesRequest.expectedRevision`). A target saved elsewhere
+   * meanwhile is a `conflict`: nothing was written, and the review offers to
+   * reload or to merge.
+   */
+  const saveAgainst = useCallback(
+    async (revision: string | undefined) => {
+      if (saving || unsafeKeys.length > 0) return;
+      if (clientIssues.length > 0) {
+        setSaveError(`${localize('com_config_validation_failed')} — ${issueSummaries.join('; ')}`);
+        return;
+      }
+      if (!hasWrites(plan)) {
+        finishWithoutWrites();
+        return;
+      }
+      setSaving(true);
+      setSaveError(null);
+      setSessionExpired(false);
+      setTermsUrl(null);
+      setConflict(false);
+      try {
+        const result = await applyChanges(editTarget, ops, revision);
+        if (result.conflict) {
+          setSaving(false);
+          setConflict(true);
+          notifyWarning(
+            localize('com_config_conflict_title'),
+            localize('com_config_conflict_toast'),
+          );
+          return;
+        }
+        const terms = termsUrlOf(result);
+        if (terms !== null) {
+          const message = localize('com_config_terms_not_accepted');
+          setSaving(false);
+          setTermsUrl(terms);
+          setSaveError(message);
+          notifyError(message);
+          return;
+        }
+        if (result.issues.length > 0 || result.failed.length > 0) {
+          const message = describeFailure(result, changeSet.collections);
+          setServerIssues([...result.issues, ...result.failed]);
+          setSaving(false);
+          setSaveError(message);
+          notifyError(message);
+          return;
+        }
+        clearEdits();
+        announceWrite(
+          [...changeSet.payload.skipped, ...result.skipped, ...result.reported],
+          result.applied,
+          localize('com_config_saved'),
+        );
+      } catch (err) {
+        const raw = err instanceof Error ? err.message : String(err);
+        const expired = isSessionError(raw);
+        const message = expired ? localize('com_config_session_expired') : raw;
+        setSaving(false);
+        setSessionExpired(expired);
+        setSaveError(message);
+        notifyError(message);
+      }
+    },
+    [
+      saving,
+      unsafeKeys,
+      clientIssues,
+      issueSummaries,
+      plan,
+      finishWithoutWrites,
+      changeSet,
+      ops,
+      clearEdits,
+      announceWrite,
+      applyChanges,
+      describeFailure,
+      editTarget,
+      localize,
+      setSaveError,
+    ],
+  );
+
+  /**
+   * Save from the review, against the revision the edits were made against.
+   * While the conflict notice is shown only Reload or Merge resolves it: Save
+   * would send that revision again and meet the same conflict. Closing the
+   * review ends the notice; the review opened again compares the edits with
+   * what is stored now, and its Save conflicts again until the admin reloads
+   * or merges.
+   */
   const handleConfirmSave = useCallback(async () => {
-    if (saving || unsafeKeys.length > 0) return;
-    if (clientIssues.length > 0) {
-      setSaveError(`${localize('com_config_validation_failed')} — ${issueSummaries.join('; ')}`);
-      return;
-    }
-    if (!hasWrites(plan)) {
-      clearEdits();
-      if (savePlan.skipped.length > 0)
-        announceWrite(savePlan.skipped, 0, localize('com_config_saved'));
-      else notifyInfo(localize('com_config_nothing_to_save'));
-      return;
-    }
-    const mcpError = findMcpError();
-    if (mcpError) {
-      setSaveError(mcpError);
-      notifyError(mcpError);
-      return;
-    }
+    if (conflict) return;
+    await saveAgainst(expectedRevision);
+  }, [conflict, saveAgainst, expectedRevision]);
 
-    setSaving(true);
+  /** Merges after a conflict: the server plans the edits over the target as stored now. */
+  const saveOverLatest = useCallback(() => saveAgainst(undefined), [saveAgainst]);
+
+  const reloadLatest = useCallback(async () => {
+    setConflict(false);
     setSaveError(null);
-    setSessionExpired(false);
-    setTermsUrl(null);
-    try {
-      const result = await applyChanges(editTarget, changeSet.ops);
-      const terms = termsUrlOf(result);
-      if (terms !== null) {
-        const message = localize('com_config_terms_not_accepted');
-        setSaving(false);
-        setTermsUrl(terms);
-        setSaveError(message);
-        notifyError(message);
-        return;
-      }
-      if (result.issues.length > 0 || result.failed.length > 0) {
-        const message = describeFailure(result, changeSet.collections);
-        setServerIssues([...result.issues, ...result.failed]);
-        setSaving(false);
-        setSaveError(message);
-        notifyError(message);
-        return;
-      }
-      clearEdits();
-      announceWrite(
-        [...changeSet.payload.skipped, ...result.skipped],
-        result.applied,
-        localize('com_config_saved'),
-      );
-    } catch (err) {
-      const raw = err instanceof Error ? err.message : String(err);
-      const expired = isSessionError(raw);
-      const message = expired ? localize('com_config_session_expired') : raw;
-      setSaving(false);
-      setSessionExpired(expired);
-      setSaveError(message);
-      notifyError(message);
-    }
-  }, [
-    saving,
-    unsafeKeys,
-    clientIssues,
-    issueSummaries,
-    plan,
-    savePlan,
-    changeSet,
-    clearEdits,
-    announceWrite,
-    findMcpError,
-    applyChanges,
-    describeFailure,
-    editTarget,
-    localize,
-    setSaveError,
-  ]);
+    await invalidateTarget(editTarget);
+  }, [invalidateTarget, editTarget, setSaveError]);
 
   /**
    * Opening the review re-reads the target, so rows saved by someone else
-   * meanwhile are flagged as drifted (SV-8). Blocking problems are listed by
-   * the review from `issues`.
+   * meanwhile are flagged as drifted (SV-8); the revision Save sends stays the
+   * one the edits were made against. Blocking problems are listed by the
+   * review from `issues`.
    */
   const openReview = useCallback(() => {
     void invalidateTarget(editTarget);
     setSaveError(null);
     setSessionExpired(false);
     setTermsUrl(null);
+    setConflict(false);
     setConfirmSaveOpen(true);
   }, [invalidateTarget, editTarget, setSaveError]);
 
@@ -481,6 +642,7 @@ export function useConfigSave({
     setSaveError(null);
     setSessionExpired(false);
     setTermsUrl(null);
+    setConflict(false);
   }, [setSaveError]);
 
   const closeReview = useCallback(() => setConfirmSaveOpen(false), []);
@@ -494,10 +656,18 @@ export function useConfigSave({
     unsafeKeys,
     changes,
     warnings: plan.warnings,
+    removedSecrets,
+    keyMoves,
     issues,
     fieldErrors,
     issueSummaries,
     handleConfirmSave,
+    finishWithoutWrites,
+    editRevision,
+    holdRevision,
+    conflict,
+    reloadLatest,
+    saveOverLatest,
     openReview,
     cancelReview,
     closeReview,
@@ -527,10 +697,11 @@ export function useResetBaseConfig({ onReset }: t.ResetBaseConfigOptions): t.Res
        *  base reset doesn't make it stale on its own — but base-derived data
        *  (schemaDefaults, base values used for MCP inheritance) feeds scope mode,
        *  so flush it too, consistent with how scope saves invalidate. */
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ['baseConfig'] }),
-        queryClient.invalidateQueries({ queryKey: ['resolvedConfig'] }),
-      ]);
+      await Promise.all(
+        [['baseConfig'], ['resolvedConfig'], ...RESOLVED_READ_QUERY_KEYS].map((queryKey) =>
+          queryClient.invalidateQueries({ queryKey }),
+        ),
+      );
       onReset();
       setResettingBase(false);
       setResetBaseOpen(false);

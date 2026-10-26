@@ -12,6 +12,7 @@ import type {
   OptionSource,
 } from './config';
 import type { KeySuggestion, KeyValidator } from './files';
+import type { MovedCredential } from './changes';
 
 /**
  * Returns a field to "Default" (removes the edit target's own value). Returns
@@ -40,6 +41,51 @@ export interface SelectFieldProps {
 /** Called with how many rows of the field `fieldId` have a problem (0 once fixed or unmounted). */
 export type RowProblemReporter = (fieldId: string, count: number) => void;
 
+/** A key of a record the edit target removes by key (`keyedTombstones`), as its editor shows it. */
+export interface RemovedRecordKey {
+  /** `saved`: removed; `pending`: removed when saved; `restoring`: removed, shown again when saved. */
+  state: 'saved' | 'pending' | 'restoring';
+  /** The value the layer beneath sets for the key. */
+  value: ConfigValue;
+}
+
+/** Removing the keys a record inherits, one by one (`keyedTombstones`): "Remove inherited key". */
+export interface RecordKeyRemoval {
+  removed: ReadonlyMap<string, RemovedRecordKey>;
+  /** Whether an inherited key can be removed: LibreChat names it by key (no dots). */
+  canRemove: (key: string) => boolean;
+  /** Removes a key, or undoes its pending removal or its restore; absent when read-only. */
+  onToggle?: (key: string) => void;
+}
+
+/** The translation keys of a toggle button: its visible label and its accessible name. */
+export interface ToggleButtonKeys {
+  label: string;
+  aria: string;
+}
+
+/** Props of a removed inherited key in a key-value editor (`RecordKeyRemoval`). */
+export interface RemovedKeyRowProps {
+  name: string;
+  /** The inherited value, as text. */
+  value: string;
+  state: RemovedRecordKey['state'];
+  disabled?: boolean;
+  onToggle?: () => void;
+}
+
+/**
+ * The record fields of one collection entry whose inherited keys can be
+ * removed by key, as the entry's editor provides them to its field rows.
+ */
+export interface EntryKeyRemoval {
+  /** The entry's data path on the page (`endpoints.custom.3`). */
+  entryPath: string;
+  /** Record fields inside the entry (`headers`, `addParams`). */
+  records: ReadonlySet<string>;
+  forRecord: (record: string) => RecordKeyRemoval;
+}
+
 export interface KeyValueFieldProps {
   id: string;
   pairs: KeyValuePair[];
@@ -54,6 +100,8 @@ export interface KeyValueFieldProps {
   valuePlaceholder?: string;
   /** Keys the layer beneath sets (librechat.yaml, Base): editable values, but no rename or delete (D3). */
   lockedKeys?: ReadonlySet<string>;
+  /** Removing locked keys by key, where the server takes it (`keyedTombstones`). */
+  keyRemoval?: RecordKeyRemoval;
   'aria-label'?: string;
 }
 
@@ -100,6 +148,8 @@ export interface SecretFieldProps {
   hasPendingEdit?: boolean;
   /** Removes the target's own stored secret (shown only when it owns one). */
   onRemove?: () => void;
+  /** How a fixed-mask preview (`SECRET_PREVIEW_MASK`) reads: where the hidden secret is set. */
+  maskLabel?: string;
   disabled?: boolean;
   width?: ControlWidth;
   'aria-label'?: string;
@@ -186,6 +236,8 @@ export interface StaticFieldProps {
   fallback?: ConfigValue;
   /** Masked display of a stored secret (already redacted by the backend), shown as-is. */
   secretPreview?: string | null;
+  /** How a fixed-mask preview reads (see `SecretFieldProps.maskLabel`). */
+  secretMaskLabel?: string;
   unit?: FieldUnit;
   width?: ControlWidth;
 }
@@ -392,3 +444,12 @@ export interface RefListFieldProps extends Omit<ListFieldProps, 'options'> {
 
 /** A model list's mode: the provider's defaults (no list set), or only the models listed. */
 export type ModelListMode = 'defaults' | 'only';
+
+/** Props of the notice under an inherited credential the target's overrides move (`secretRebinding`). */
+export interface SecretNotSentNoticeProps {
+  credential: MovedCredential;
+  /** The settings that moved it, labelled ("Base URL"). */
+  fields: string;
+  /** Read-only: the notice offers no restate. */
+  disabled?: boolean;
+}

@@ -3,8 +3,11 @@ import { useEffect, useMemo, useState } from 'react';
 import { configSchema } from 'librechat-data-provider';
 import type * as t from '@/types';
 import {
+  carryChanges,
+  getScopeIndex,
   flattenObject,
   getValueAtPath,
+  restateChanges,
   mergeScopeLayer,
   collectLeafPaths,
   createBaseLayers,
@@ -16,7 +19,11 @@ import { extractSchemaTree, extractSchemaDefaults } from '@/server/config';
 import { CollectionEditsContext } from '@/contexts/CollectionEditsContext';
 import { buildConfigChanges } from '@/components/configuration/edits';
 import { collectFieldPaths } from '@/components/configuration/counts';
+import { BUNDLED_CONFIG_CONTRACT, getWriteRules } from '@/constants';
+import { ConfigContractContext } from '@/contexts/ContractContext';
 import { ConfigTabContent } from '@/components/configuration';
+import { ScopeActionsContext } from '@/contexts/ScopeContext';
+import { RenamesContext } from '@/contexts/RenamesContext';
 import { ExpandContext } from '@/contexts/ExpandContext';
 
 /** The schema tree exactly as `extractSchemaTree` returns it (interface permissions included). */
@@ -52,25 +59,49 @@ export interface TabHarnessOptions {
   yaml?: t.ConfigRecord;
   /** The base admin overrides. */
   overrides?: t.ConfigRecord;
+  /** The base admin tombstones (none by default). */
+  tombstones?: string[];
   /** Press "Expand all" once rendered: every collapsible opens, lazily mounted ones too. */
   expandAll?: boolean;
+  /** The connected server's admin config contract; the bundled one (an older server) by default. */
+  contract?: t.ConfigContract;
+  /** The profiles the page's scope index lists (none by default). */
+  profiles?: t.ConfigScope[];
 }
 
 export interface TabHarness {
   /** The page's pending edits, as `useConfigEdits` holds them now. */
   edits: () => t.ConfigEditsState;
-  /** What Save would write now: the pending edits through the real change and write planners. */
+  /**
+   * What Save would write now: the pending edits, with what renamed and
+   * duplicated entries carry and the credentials they restate, through the
+   * real change and write planners.
+   */
   plan: () => t.WritePlan;
 }
 
-interface HarnessProps extends Required<Omit<TabHarnessOptions, 'expandAll'>> {
+const NO_TOMBSTONES: string[] = [];
+
+interface HarnessProps extends Required<Omit<TabHarnessOptions, 'expandAll' | 'profiles'>> {
   expandAll: boolean;
   state: { edits: t.ConfigEditsState | null; plan: (() => t.WritePlan) | null };
 }
 
-function TabPage({ tab, tree, yaml, overrides, expandAll, state }: HarnessProps) {
+function TabPage({
+  tab,
+  tree,
+  yaml,
+  overrides,
+  tombstones,
+  expandAll,
+  contract,
+  state,
+}: HarnessProps) {
   const schemaPathSet = useMemo(() => new Set(collectFieldPaths(tree)), [tree]);
-  const config = useMemo(() => mergeScopeLayer(yaml, overrides), [yaml, overrides]);
+  const config = useMemo(
+    () => mergeScopeLayer(yaml, overrides, tombstones, getWriteRules(contract)),
+    [yaml, overrides, tombstones, contract],
+  );
   const layers = useMemo(
     () =>
       createBaseLayers(
@@ -79,13 +110,13 @@ function TabPage({ tab, tree, yaml, overrides, expandAll, state }: HarnessProps)
           yamlConfig: yaml,
           yamlPaths: collectLeafPaths(yaml),
           dbOverrides: overrides,
-          dbTombstones: [],
+          dbTombstones: tombstones,
           schemaDefaults: SCHEMA_DEFAULTS,
         },
         schemaPathSet,
         runtimeDefaultAt,
       ),
-    [config, yaml, overrides, schemaPathSet],
+    [config, yaml, overrides, tombstones, schemaPathSet],
   );
   const flatBaseline = useMemo(() => flattenObject(config), [config]);
   const edits = useConfigEdits({
@@ -130,35 +161,55 @@ function TabPage({ tab, tree, yaml, overrides, expandAll, state }: HarnessProps)
       root: config,
       collections: edits.collectionEdits,
       visibility: edits.visibilityEdits,
+      writeRules: getWriteRules(contract),
     });
-    return planConfigChanges(changes.ops, { stored: overrides, lower: yaml, lowerKind: 'yaml' });
+    const ops = [
+      ...changes.ops,
+      ...carryChanges(edits.renameEdits, edits.copyEdits),
+      ...restateChanges(edits.restateEdits),
+    ];
+    return planConfigChanges(
+      ops,
+      { stored: overrides, tombstones, lower: yaml, lowerKind: 'yaml' },
+      contract.features,
+      getWriteRules(contract),
+      contract.limits,
+    );
   };
+
+  const renames = useMemo<t.EntryRenames>(
+    () => ({ renames: edits.renameEdits, copies: edits.copyEdits }),
+    [edits.renameEdits, edits.copyEdits],
+  );
 
   return (
     <ExpandContext.Provider value={signal}>
       <CollectionEditsContext.Provider value={edits.collectionEdits}>
-        <ConfigTabContent
-          sections={sections}
-          configValues={shown}
-          editedValues={edits.editedValues}
-          onFieldChange={edits.handleFieldChange}
-          onResetField={edits.handleResetField}
-          onDiscardField={edits.handleDiscardField}
-          previewMode={false}
-          permissions={{ canView: true, canEdit: true, canAssign: true }}
-          showChangedOnly={false}
-          configuredPaths={configuredPaths}
-          dbOverridePaths={overridePaths}
-          touchedPaths={edits.touchedPaths}
-          pendingResets={edits.pendingResets}
-          sectionPermissions={sectionPermissions}
-          schemaDefaults={SCHEMA_DEFAULTS}
-          editSessionId={edits.editSessionId}
-          valueLayers={layers}
-          visibilityEdits={edits.visibilityEdits}
-          onHideField={edits.handleHideField}
-          onUnhideField={edits.handleUnhideField}
-        />
+        <RenamesContext.Provider value={renames}>
+          <ConfigTabContent
+            sections={sections}
+            configValues={shown}
+            editedValues={edits.editedValues}
+            onFieldChange={edits.handleFieldChange}
+            onResetField={edits.handleResetField}
+            onDiscardField={edits.handleDiscardField}
+            previewMode={false}
+            permissions={{ canView: true, canEdit: true, canAssign: true }}
+            showChangedOnly={false}
+            configuredPaths={configuredPaths}
+            dbOverridePaths={overridePaths}
+            touchedPaths={edits.touchedPaths}
+            pendingResets={edits.pendingResets}
+            sectionPermissions={sectionPermissions}
+            schemaDefaults={SCHEMA_DEFAULTS}
+            editSessionId={edits.editSessionId}
+            valueLayers={layers}
+            visibilityEdits={edits.visibilityEdits}
+            onHideField={edits.handleHideField}
+            onUnhideField={edits.handleUnhideField}
+            onRenameEntry={edits.handleRenameEntry}
+          />
+        </RenamesContext.Provider>
       </CollectionEditsContext.Provider>
     </ExpandContext.Provider>
   );
@@ -175,18 +226,31 @@ export function renderTab({
   tree = PAGE_TREE,
   yaml = {},
   overrides = {},
+  tombstones = NO_TOMBSTONES,
   expandAll = false,
+  contract = BUNDLED_CONFIG_CONTRACT,
+  profiles = [],
 }: TabHarnessOptions): TabHarness & ReturnType<typeof render> {
   const state: HarnessProps['state'] = { edits: null, plan: null };
+  const scopeActions: t.ScopeContextValue = {
+    selectScope: () => undefined,
+    index: getScopeIndex(profiles),
+  };
   const result = render(
-    <TabPage
-      tab={tab}
-      tree={tree}
-      yaml={yaml}
-      overrides={overrides}
-      expandAll={expandAll}
-      state={state}
-    />,
+    <ConfigContractContext.Provider value={contract}>
+      <ScopeActionsContext.Provider value={scopeActions}>
+        <TabPage
+          tab={tab}
+          tree={tree}
+          yaml={yaml}
+          overrides={overrides}
+          tombstones={tombstones}
+          expandAll={expandAll}
+          contract={contract}
+          state={state}
+        />
+      </ScopeActionsContext.Provider>
+    </ConfigContractContext.Provider>,
   );
   return {
     ...result,

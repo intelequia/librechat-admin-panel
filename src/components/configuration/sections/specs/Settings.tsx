@@ -3,8 +3,23 @@ import { useNavigate } from '@tanstack/react-router';
 import { normalizeEndpointName } from 'librechat-data-provider';
 import type { ReactNode } from 'react';
 import type * as t from '@/types';
-import { cn, isRowVisible, isConfigRecord, stringItems } from '@/utils';
-import { useLocalize, useFieldState, useValuesScope } from '@/hooks';
+import {
+  cn,
+  isRowVisible,
+  stringItems,
+  isSetByLayer,
+  isConfigRecord,
+  deriveSpecControl,
+  selectsHiddenEndpoint,
+  foldsEndpointReferences,
+} from '@/utils';
+import {
+  useLocalize,
+  useFieldState,
+  useValuesScope,
+  useHiddenEntries,
+  useConfigContract,
+} from '@/hooks';
 import { DecorativeIcon, StateChip } from '@/components/shared';
 import { RowFilterContext } from '@/contexts/RowFilterContext';
 import { hasPathOrDescendant } from '../../renderer/paths';
@@ -77,22 +92,26 @@ function modeLayerFormatter(
 
 /**
  * Whether the endpoint menu shows: `interface.modelSelect` when set, else
- * what LibreChat derives with specs configured (on only with added endpoints).
+ * what LibreChat derives with specs configured (on only with added
+ * endpoints). Before `specInterfaceRederive`, LibreChat derived it once, from
+ * librechat.yaml's specs, so the value it serves (`value`) stands; once it
+ * derives it again from the specs served (`derives`), a value no layer sets
+ * follows the specs shown here.
  */
-function modelSelectOn(value: t.ConfigValue, specCount: number, added: number): boolean {
-  if (typeof value === 'boolean') return value;
-  return specCount > 0 ? added > 0 : true;
+function modelSelectOn(
+  value: t.ConfigValue,
+  specCount: number,
+  added: number,
+  derives: boolean,
+): boolean {
+  if (typeof value === 'boolean' && !derives) return value;
+  return deriveSpecControl('modelSelect', specCount, added);
 }
 
 /** "Users will see: 3 specs, plus OpenAI and Agents in the endpoint menu. 1 more is hidden." */
 export function previewText(
   localize: t.LocalizeFn,
-  {
-    items,
-    mode,
-    menuOn,
-    added,
-  }: { items: t.ConfigValue[]; mode: t.SpecSelectionMode; menuOn: boolean; added: string[] },
+  { items, mode, menuOn, added, addsNone = false }: t.SpecsPreviewInput,
 ): string {
   if (items.length === 0) {
     return localize(
@@ -107,6 +126,7 @@ export function previewText(
     if (added.length > 0) {
       return localize('com_config_specs_preview_added', { specs, endpoints: added.join(', ') });
     }
+    if (addsNone) return localize('com_config_specs_preview_added_none', { specs });
     return localize('com_config_specs_preview_all', { specs });
   })();
   if (hidden === 0) return sentence;
@@ -172,6 +192,10 @@ export function SpecsSettings({
   showConfiguredOnly,
 }: t.SpecsSettingsProps) {
   const localize = useLocalize();
+  const contract = useConfigContract();
+  /** A server that folds endpoint references matches `Ollama` to `ollama`: neither spelling "never matches". */
+  const foldsNames = foldsEndpointReferences(contract);
+  const { specInterfaceRederive } = contract.features;
   const navigate = useNavigate();
   const scope = useValuesScope();
   const rowFilter = useContext(RowFilterContext);
@@ -181,7 +205,24 @@ export function SpecsSettings({
   const prioritize = asBool(getValue(PRIORITIZE, undefined), true);
   const mode = modeOf(enforce, prioritize);
   const added = stringItems(getValue(ADDED, undefined));
-  const menuOn = modelSelectOn(getValue(MODEL_SELECT, undefined), items.length, added.length);
+  /** What the profile's members get: LibreChat leaves out the specs and added endpoints it hides (`keyedTombstones`). */
+  const { hidden: hiddenEndpoints } = useHiddenEntries('endpoints.custom');
+  const hiddenIds = new Set(hiddenEndpoints.keys());
+  const servedItems = items.filter((spec) => !selectsHiddenEndpoint(spec, hiddenIds));
+  const servedAdded = added.filter((name) => !hiddenIds.has(normalizeEndpointName(name)));
+  /**
+   * The endpoint menu: LibreChat derives an unset `modelSelect` from the configured specs when it
+   * loads, and a profile's hides don't change that, unless the server derives it again after the
+   * merge (`specInterfaceRederive`), from the specs and added endpoints the members are served.
+   */
+  const modelSelectState = useFieldState(MODEL_SELECT);
+  const derivesMenu = specInterfaceRederive && !isSetByLayer(modelSelectState);
+  const menuOn = modelSelectOn(
+    getValue(MODEL_SELECT, undefined),
+    derivesMenu ? servedItems.length : items.length,
+    derivesMenu ? servedAdded.length : added.length,
+    derivesMenu,
+  );
   const canEdit = !disabled && permissions?.canEdit !== false;
   const isShown = (path: string) =>
     isRowVisible(rowFilter, path) &&
@@ -308,15 +349,15 @@ export function SpecsSettings({
       {showsMode && enforce && !prioritize && (
         <SpecNote tone="warning">{localize('com_config_specs_mode_mixed')}</SpecNote>
       )}
-      {items.length === 0 && !menuOn && (
+      {servedItems.length === 0 && !menuOn && (
         <SpecNote tone="warning" action={modelSelectLink}>
           {localize('com_config_specs_empty_menu_off')}
         </SpecNote>
       )}
-      {showsMode && mode === 'enforce' && items.length === 0 && menuOn && (
+      {showsMode && mode === 'enforce' && servedItems.length === 0 && menuOn && (
         <SpecNote tone="info">{localize('com_config_specs_enforce_empty')}</SpecNote>
       )}
-      {showsMode && mode === 'enforce' && items.length > 0 && menuOn && (
+      {showsMode && mode === 'enforce' && servedItems.length > 0 && menuOn && (
         <SpecNote tone="warning" action={modelSelectLink}>
           {localize('com_config_specs_enforce_menu_on')}
         </SpecNote>
@@ -353,9 +394,10 @@ export function SpecsSettings({
               return true;
             }}
             addLabel={localize('com_config_specs_added_add')}
+            matchValue={foldsNames ? normalizeEndpointName : undefined}
             unknownLabel={(name) => {
               const served = normalizeEndpointName(name);
-              return served !== name && options.knownEndpoints.has(served)
+              return !foldsNames && served !== name && options.knownEndpoints.has(served)
                 ? localize('com_config_specs_added_served_as', { name, served })
                 : localize('com_config_specs_not_configured', { name });
             }}
@@ -372,10 +414,11 @@ export function SpecsSettings({
         <SpecNote tone="preview" icon={<DecorativeIcon name="users" size="sm" />}>
           <span className="font-medium">{localize('com_config_specs_preview_label')}</span>{' '}
           {previewText(localize, {
-            items,
+            items: servedItems,
             mode,
             menuOn,
-            added: added.map((name) => endpointLabelOf(options, name)),
+            added: servedAdded.map((name) => endpointLabelOf(options, name)),
+            addsNone: servedAdded.length === 0 && added.length > 0,
           })}
         </SpecNote>
       )}
